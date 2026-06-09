@@ -1,0 +1,32 @@
+# tourmind-ai 模块测试配置
+# 集成测试（@Tag("integration")）需要 MySQL / Redis / Ollama 可用
+
+spring:
+  profiles:
+    active: ai
+  main:
+    allow-bean-definition-overriding: true
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://localhost:3306/dp?allowPublicKeyRetrieval=true&useSSL=false&serverTimezone=UTC
+    username: root
+    password: '004147'
+  data:
+    redis:
+      host: 127.0.0.1
+      port: 6379
+      password: '004147'
+
+mybatis-plus:
+  type-aliases-package: com.hmdp.entity
+
+rag:
+  top-k: 5
+  similarity-threshold: 0.6
+  max-context-spots: 10
+  allow-empty-context: true
+
+conversation:
+  timeout-minutes: 30
+  max-messages: 20
+  max-conversations-per-user: 5

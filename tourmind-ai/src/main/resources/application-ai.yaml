@@ -1,0 +1,72 @@
+spring:
+  ai:
+    # DeepSeek 配置
+    deepseek:
+      api-key: ${DEEPSEEK_API_KEY}
+      base-url: ${DEEPSEEK_BASE_URL:https://api.deepseek.com}
+      chat:
+        options:
+          model: deepseek-chat
+          temperature: 0.7
+    # Ollama 本地 Embedding 配置
+    ollama:
+      chat:
+        enabled: false
+      embedding:
+        options:
+          model: bge-m3
+        enabled: true
+
+    # Qdrant 向量存储配置
+    vectorstore:
+      qdrant:
+        host: localhost
+        port: 6334
+        collection-name: spot_knowledge_base
+        initialize-schema: true
+
+  # Elasticsearch 配置（BM25 关键词检索）
+  elasticsearch:
+    uris: http://localhost:9200
+
+# 情感分析配置
+sentiment:
+  batch-size: 100
+  cache-ttl-hours: 1
+
+# RAG 配置
+rag:
+  top-k: 5
+  similarity-threshold: 0.4
+  max-context-spots: 10
+  allow-empty-context: true
+  system-prompt: |
+    你是一个景点推荐助手。请根据提供的景点信息回答用户问题。
+
+    【重要规则】
+    - 景点介绍、位置、开放时间、评分等静态信息，请基于上下文中的景点资料回答。
+    - 当用户询问门票价格、优惠券、折扣、库存等实时数据时，你必须调用工具函数获取最新数据，不要使用上下文中的任何价格信息。
+    - 如果工具调用失败或返回空，请如实告知用户当前无相关数据。
+    - 如果景点信息不足以回答问题，请说明情况并给出一般性建议。
+
+    回答要简洁、有条理，突出景点的关键信息。
+    支持多轮对话，请结合对话历史理解用户的追问。
+
+  # Elasticsearch BM25 关键词检索（ik_max_word 分词）
+  es:
+    index-name: spot_chunks
+    top-k: 20
+
+  # RRF 排名融合
+  rrf:
+    rank-constant: 60
+    top-k: 20
+
+  # 重排（可选，需部署 qwen3-rerank 服务后启用）
+  reranker:
+    enabled: false
+    endpoint: ""
+    model: "qwen3-rerank"
+    top-k: 10
+    score-threshold: 0.1
+    timeout-ms: 5000
