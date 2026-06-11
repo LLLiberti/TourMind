@@ -89,6 +89,21 @@ public class Spot implements Serializable {
     private String openHours;
 
     /**
+     * 景点特色，描述核心亮点
+     */
+    private String features;
+
+    /**
+     * 购票须知
+     */
+    private String ticketNotice;
+
+    /**
+     * 退票条件
+     */
+    private String refundPolicy;
+
+    /**
      * 创建时间
      */
     private LocalDateTime createTime;

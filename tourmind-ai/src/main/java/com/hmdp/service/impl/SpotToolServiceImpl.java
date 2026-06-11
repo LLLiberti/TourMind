@@ -10,8 +10,6 @@ import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
 
 import jakarta.annotation.Resource;
-import java.math.BigDecimal;
-import java.math.RoundingMode;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ThreadLocalRandom;
@@ -22,7 +20,7 @@ import java.util.concurrent.TimeUnit;
  *
  * <h3>数据来源</h3>
  * <ul>
- *   <li>门票价格：{@link SpotMapper} 查询 {@code tb_spot.ticket_price}（带 Redis 缓存）</li>
+ *   <li>门票价格：{@link SpotMapper} 查询 {@code tb_spot.ticket_price}（单位：元，带 Redis 缓存）</li>
  *   <li>优惠券：{@link SpotVoucherMapper} 查询 {@code tb_voucher} + {@code tb_seckill_voucher}</li>
  *   <li>库存：{@link SpotVoucherMapper} 查询 {@code tb_seckill_voucher.stock}</li>
  * </ul>
@@ -59,16 +57,17 @@ public class SpotToolServiceImpl implements ISpotToolService {
             return "未找到 ID 为 " + spotId + " 的景点信息";
         }
 
-        Long priceInCents = spot.getTicketPrice();
-        if (priceInCents == null) {
+        Long priceInYuan = spot.getTicketPrice();
+        if (priceInYuan == null) {
             return String.format("景点【%s】暂无门票价格信息", spot.getName());
         }
 
-        // ticketPrice 以分为单位存储，转换为元
-        BigDecimal priceInYuan = BigDecimal.valueOf(priceInCents)
-                .divide(BigDecimal.valueOf(100), 2, RoundingMode.HALF_UP);
+        // ticketPrice 以元为单位存储
+        if (priceInYuan == 0) {
+            return String.format("景点【%s】免费开放，无需门票", spot.getName());
+        }
 
-        return String.format("景点【%s】当前门票价格为 %.2f 元", spot.getName(), priceInYuan);
+        return String.format("景点【%s】当前门票价格为 %d 元", spot.getName(), priceInYuan);
     }
 
     @Override

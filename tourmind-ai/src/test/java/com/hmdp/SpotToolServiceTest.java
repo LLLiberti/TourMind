@@ -59,7 +59,7 @@ class SpotToolServiceTest {
         spot = new Spot();
         spot.setId(1L);
         spot.setName("西湖");
-        spot.setTicketPrice(8000L);  // 80.00 元（以分为单位）
+        spot.setTicketPrice(80L);  // 80 元
 
         // 默认：Redis 缓存未命中 → 走 DB 查询 → 回写缓存
         when(redisTemplate.opsForValue()).thenReturn(valueOperations);
@@ -78,7 +78,7 @@ class SpotToolServiceTest {
             String result = toolService.getSpotPrice(1L);
 
             assertThat(result).contains("西湖");
-            assertThat(result).contains("80.00 元");
+            assertThat(result).contains("80 元");
             System.out.println(result);
         }
 

@@ -45,6 +45,22 @@ public interface ISpotQAService {
     com.hmdp.dto.Result getConversationInfo(Long userId, String sessionId);
 
     /**
+     * Agent 模式问答 — LLM 自主决策是否检索、调用哪些工具、何时回答。
+     * 与 {@link #answerSpotQuestion} 的区别：不经过固定的 RAG 管线，
+     * 而是让 LLM 在 ReACT 循环中自行规划执行路径。
+     *
+     * @param userId 用户 ID
+     * @param sessionId 会话 ID（可选）
+     * @param question 用户问题
+     * @param userX 用户经度（可选）
+     * @param userY 用户纬度（可选）
+     * @param limit 返回景点数限制
+     * @return 问答结果（含 Agent 执行追踪）
+     */
+    Result answerSpotQuestionAgent(Long userId, String sessionId, String question,
+                                   Double userX, Double userY, int limit);
+
+    /**
      * 获取用户所有会话
      * @param userId 用户 ID
      * @return 会话列表

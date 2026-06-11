@@ -2,7 +2,7 @@ spring:
   ai:
     # DeepSeek 配置
     deepseek:
-      api-key: ${DEEPSEEK_API_KEY}
+      api-key: ${DEEPSEEK_API_KEY:sk-f19c73519fca495dbda1dcbc760fee1f}
       base-url: ${DEEPSEEK_BASE_URL:https://api.deepseek.com}
       chat:
         options:
@@ -28,6 +28,8 @@ spring:
   # Elasticsearch 配置（BM25 关键词检索）
   elasticsearch:
     uris: http://localhost:9200
+    username: ${ES_USERNAME:elastic}
+    password: ${ES_PASSWORD:004147}
 
 # 情感分析配置
 sentiment:
@@ -41,16 +43,27 @@ rag:
   max-context-spots: 10
   allow-empty-context: true
   system-prompt: |
-    你是一个景点推荐助手。请根据提供的景点信息回答用户问题。
+    你是一个景点推荐助手。请严格根据提供的景点信息回答用户问题。
 
-    【重要规则】
-    - 景点介绍、位置、开放时间、评分等静态信息，请基于上下文中的景点资料回答。
-    - 当用户询问门票价格、优惠券、折扣、库存等实时数据时，你必须调用工具函数获取最新数据，不要使用上下文中的任何价格信息。
+    【核心原则：严格基于上下文】
+    - 你只能使用上下文中明确提供的信息来回答，绝对禁止根据自身训练数据编造、补充或推测任何信息。
+    - 上下文中的景点信息包含：景点ID、名称、类型、区域、地址、评分、开放时间、距离。
+    - 呈现景点时只列出上下文中实际存在的字段，不要自行添加"亮点""特色""推荐理由""游玩建议""历史背景"等任何上下文没有的内容。
+    - 如果上下文没有提供某个信息，直接说明"未提供该信息"，不要尝试补充。
+
+    【工具调用规则】
+    - 上下文中每个景点都有"景点ID"字段，这是调用工具函数时必须使用的标识。
+    - 当用户询问门票价格、优惠券、折扣、库存等实时数据时，你必须调用工具函数获取最新数据：
+      * 查询门票价格 → 调用 getSpotPrice，参数 spotId 填上下文中的"景点ID"
+      * 查询优惠券/折扣 → 调用 getSpotVouchers，参数 spotId 填上下文中的"景点ID"
+      * 查询优惠券库存 → 调用 checkVoucherStock，参数 voucherId 从 getSpotVouchers 返回结果中获取
+      * 查询天气 → 调用 checkWeather，参数 location 填景点名称或城市名，lat/lon 填上下文中的坐标（y 为纬度，x 为经度）
+    - 绝对不要使用上下文或训练数据中的任何价格/天气信息，必须以工具返回的实时数据为准。
     - 如果工具调用失败或返回空，请如实告知用户当前无相关数据。
-    - 如果景点信息不足以回答问题，请说明情况并给出一般性建议。
 
-    回答要简洁、有条理，突出景点的关键信息。
-    支持多轮对话，请结合对话历史理解用户的追问。
+    【回答风格】
+    - 简洁、有条理，只呈现上下文和工具返回的事实信息。
+    - 支持多轮对话，请结合对话历史理解用户的追问。
 
   # Elasticsearch BM25 关键词检索（ik_max_word 分词）
   es:
@@ -70,3 +83,31 @@ rag:
     top-k: 10
     score-threshold: 0.1
     timeout-ms: 5000
+
+  # Adaptive 分流 — 闲聊直接 LLM 回答，跳过 RAG
+  router:
+    enabled: true
+
+  # CRAG 检索评估 — 低质量结果自动回退
+  evaluator:
+    confident-threshold: 0.6
+    ambiguous-threshold: 0.4
+
+  # 退购票知识库 — 独立的 Qdrant collection + ES index
+  ticket-refund:
+    qdrant:
+      collection-name: ticket_refund_kb
+    es:
+      index-name: ticket_refund_chunks
+      top-k: 10
+
+  # ReACT Agent 配置
+  agent:
+    enabled: true
+    max-iterations: 10
+    timeout-ms: 30000
+    planner:
+      enabled: true
+      max-sub-iterations: 3
+      sub-timeout-ms: 15000
+      max-sub-tasks: 5

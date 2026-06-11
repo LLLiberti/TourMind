@@ -5,28 +5,28 @@ import com.hmdp.mapper.SpotKnowledgeMapper;
 import com.hmdp.mapper.SpotMapper;
 import com.hmdp.mapper.SpotTypeMapper;
 import com.hmdp.rag.client.QwenRerankClient;
+import com.hmdp.rag.evaluation.RetrievalEvaluator;
 import com.hmdp.rag.index.EsChunkIndexer;
 import com.hmdp.rag.index.ParentChildIndexer;
+import com.hmdp.rag.index.TicketRefundIndexer;
 import com.hmdp.rag.query.RewriteQueryTransformer;
+import com.hmdp.rag.router.QueryRouter;
 import com.hmdp.rag.retrieval.EsBm25Retriever;
 import com.hmdp.rag.retrieval.HybridDocumentRetriever;
 import com.hmdp.rag.retrieval.RrfRankFuser;
 import com.hmdp.tool.SpotTools;
+import com.hmdp.tool.WeatherTools;
+import io.qdrant.client.QdrantClient;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor;
 import org.springframework.ai.chat.client.advisor.SimpleLoggerAdvisor;
 import org.springframework.ai.chat.memory.ChatMemory;
-import org.springframework.ai.chat.messages.Message;
 import org.springframework.ai.chat.model.ChatModel;
-import org.springframework.ai.rag.Query;
-import org.springframework.ai.rag.advisor.RetrievalAugmentationAdvisor;
-import org.springframework.ai.rag.generation.augmentation.ContextualQueryAugmenter;
-import org.springframework.ai.rag.preretrieval.query.transformation.CompressionQueryTransformer;
-import org.springframework.ai.rag.preretrieval.query.transformation.QueryTransformer;
-import org.springframework.ai.rag.retrieval.search.DocumentRetriever;
+import org.springframework.ai.embedding.EmbeddingModel;
 import org.springframework.ai.vectorstore.VectorStore;
-import java.util.List;
-
+import org.springframework.ai.vectorstore.qdrant.QdrantVectorStore;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
@@ -34,42 +34,23 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.data.redis.core.RedisTemplate;
 
 /**
- * Spring AI 核心配置 — 模块化 RAG + Function Calling 混合架构。
+ * Spring AI 核心配置 — Agentic RAG 架构（ReACT Agent + 检索/工具组件）。
  *
- * <h3>Advisor 链</h3>
- * <ol>
- *   <li><b>MessageChatMemoryAdvisor</b> — 自动管理多轮对话记忆</li>
- *   <li><b>RetrievalAugmentationAdvisor</b> — 模块化 RAG：
- *     CompressionQueryTransformer → RewriteQueryTransformer →
- *     HybridDocumentRetriever（向量+BM25动态混合+重排）→ ContextualQueryAugmenter</li>
- *   <li><b>SimpleLoggerAdvisor</b> — 请求/响应日志</li>
- * </ol>
+ * <h3>架构</h3>
+ * <p>RAG 检索已迁移至 Agent 路径（{@code ReActAgentLoop} + {@code SearchKnowledgeBaseTool}），
+ * 由 LLM 在 ReACT 循环中自主决定是否检索、检索几次、何时调用实时数据工具。</p>
  *
- * <h3>Function Calling</h3>
- * <p>通过 {@code SpotTools} 注册 3 个工具函数（价格、优惠券、库存），
- * LLM 根据用户问题自动决定是否调用。实时数据不进入 RAG 知识库。</p>
+ * <h3>ChatClient</h3>
+ * <p>仅保留 {@code MessageChatMemoryAdvisor} + {@code SimpleLoggerAdvisor} + {@code SpotTools}/{@code WeatherTools}，
+ * 用于闲聊/指定景点问答等简单场景，不再承担检索职责。</p>
  *
  * <h3>VectorStore</h3>
- * <p>Qdrant VectorStore 由 Spring AI 自动配置，配置见 application-ai.yaml。
- * 本类不手动创建 VectorStore Bean，直接注入自动配置生成的实例。</p>
- *
- * <h3>新增组件</h3>
- * <ul>
- *   <li><b>HybridDocumentRetriever</b> — 混合检索器：ES BM25 + Qdrant 向量 + RRF 融合 + 可选重排</li>
- *   <li><b>EsBm25Retriever</b> — Elasticsearch BM25 关键词检索（ik_max_word 分词）</li>
- *   <li><b>EsChunkIndexer</b> — ES 索引管理器（chunk 写入 / 删除）</li>
- *   <li><b>RrfRankFuser</b> — RRF 排名融合引擎</li>
- *   <li><b>ParentChildIndexer</b> — Father-Child 索引：父文档全文 + 子文档分块（Qdrant + ES + MySQL + Redis）</li>
- *   <li><b>QwenRerankClient</b> — qwen3-rerank 两阶段精排（可选，需外部服务）</li>
- * </ul>
- *
- * @see HybridDocumentRetriever
- * @see EsBm25Retriever
- * @see RrfRankFuser
- * @see SpotTools
+ * <p>Qdrant VectorStore 由 Spring AI 自动配置，配置见 application-ai.yaml。</p>
  */
 @Configuration
 public class AIConfig {
+
+    private static final Logger log = LoggerFactory.getLogger(AIConfig.class);
 
     // ==================== 模块化 RAG 组件 ====================
 
@@ -87,9 +68,15 @@ public class AIConfig {
                                                           ParentChildIndexer parentChildIndexer,
                                                           @org.springframework.beans.factory.annotation.Autowired(
                                                                   required = false)
-                                                          QwenRerankClient rerankClient) {
+                                                          QwenRerankClient rerankClient,
+                                                          @Qualifier("ticketRefundVectorStore")
+                                                          VectorStore ticketRefundVectorStore,
+                                                          @Qualifier("ticketRefundEsBm25Retriever")
+                                                          EsBm25Retriever ticketRefundEsBm25Retriever,
+                                                          RetrievalEvaluator retrievalEvaluator) {
         return new HybridDocumentRetriever(vectorStore, spotMapper, spotTypeMapper, ragConfig,
-                esBm25Retriever, rrfRankFuser, parentChildIndexer, rerankClient);
+                esBm25Retriever, rrfRankFuser, parentChildIndexer, rerankClient,
+                ticketRefundVectorStore, ticketRefundEsBm25Retriever, retrievalEvaluator);
     }
 
     /**
@@ -106,6 +93,67 @@ public class AIConfig {
     @Bean
     public EsChunkIndexer esChunkIndexer(ElasticsearchClient esClient, RagConfig ragConfig) {
         return new EsChunkIndexer(esClient, ragConfig.getEs().getIndexName());
+    }
+
+    // ==================== 退购票知识库组件 ====================
+
+    /**
+     * 退购票知识库 Qdrant VectorStore — 独立的 collection，存储购票须知和退票条件子文档。
+     */
+    @Bean
+    public VectorStore ticketRefundVectorStore(QdrantClient qdrantClient,
+                                                EmbeddingModel embeddingModel,
+                                                RagConfig ragConfig) {
+        return QdrantVectorStore.builder(qdrantClient, embeddingModel)
+                .collectionName(ragConfig.getTicketRefund().getQdrant().getCollectionName())
+                .initializeSchema(true)
+                .build();
+    }
+
+    /**
+     * 退购票知识库 ES 索引管理器 — 独立的 ES index。
+     */
+    @Bean
+    public EsChunkIndexer ticketRefundEsChunkIndexer(ElasticsearchClient esClient, RagConfig ragConfig) {
+        return new EsChunkIndexer(esClient, ragConfig.getTicketRefund().getEs().getIndexName());
+    }
+
+    /**
+     * 退购票知识库 ES BM25 检索器。
+     */
+    @Bean
+    public EsBm25Retriever ticketRefundEsBm25Retriever(ElasticsearchClient esClient, RagConfig ragConfig) {
+        return new EsBm25Retriever(esClient, ragConfig.getTicketRefund().getEs().getIndexName());
+    }
+
+    /**
+     * 退购票知识库索引器 — 将购票须知和退票条件写入 Qdrant + ES。
+     */
+    @Bean
+    public TicketRefundIndexer ticketRefundIndexer(
+            @Qualifier("ticketRefundVectorStore") VectorStore ticketRefundVectorStore,
+            @Qualifier("ticketRefundEsChunkIndexer") EsChunkIndexer ticketRefundEsChunkIndexer) {
+        return new TicketRefundIndexer(ticketRefundVectorStore, ticketRefundEsChunkIndexer);
+    }
+
+    // ==================== Adaptive 分流 + CRAG 评估 ====================
+
+    /**
+     * Adaptive 查询分流器 — 闲聊直接 LLM 回答，知识查询走 RAG。
+     */
+    @Bean
+    public QueryRouter queryRouter() {
+        return new QueryRouter();
+    }
+
+    /**
+     * CRAG 检索质量评估器 — 低质量结果自动回退，减少幻觉。
+     */
+    @Bean
+    public RetrievalEvaluator retrievalEvaluator(RagConfig ragConfig) {
+        return new RetrievalEvaluator(
+                ragConfig.getEvaluator().getConfidentThreshold(),
+                ragConfig.getEvaluator().getAmbiguousThreshold());
     }
 
     /**
@@ -138,130 +186,15 @@ public class AIConfig {
         return new QwenRerankClient(ragConfig.getReranker());
     }
 
+    // ==================== Query 重写（Agent 路径复用） ====================
+
     /**
-     * 上下文查询增强器 — 将检索到的文档注入到 prompt 中
+     * Query 改写为关键词 — 供 Agent 路径的 SearchKnowledgeBaseTool 使用。
      */
     @Bean
-    public ContextualQueryAugmenter contextualQueryAugmenter(RagConfig ragConfig) {
-        return ContextualQueryAugmenter.builder()
-                .allowEmptyContext(ragConfig.isAllowEmptyContext())
-                .build();
-    }
-
-    /**
-     * 查询重写变换器 — 将口语化 query 改写为关键词串，提升向量检索召回率。
-     *
-     * <p>在 {@link CompressionQueryTransformer} 之前执行，
-     * 将"西湖有啥好玩的推荐一下呗"改写为"西湖 自然风景区 游览 推荐 好玩 必去 景点"。</p>
-     */
-    @Bean
-    public QueryTransformer rewriteQueryTransformer(
-            @Qualifier("deepSeekChatModel") ChatModel chatModel) {
-        return new RewriteQueryTransformer(chatModel);
-    }
-
-    /**
-     * 查询压缩变换器（含历史增强包装） — 在多轮对话中将指代词消解为独立查询
-     *
-     * <p>{@link CompressionQueryTransformer} 的正确用法要求 {@link Query#history()} 中包含对话历史，
-     * 但 Spring AI 1.0.7 的 {@link RetrievalAugmentationAdvisor} 构建 Query 时
-     * 取的是 {@code Prompt.getInstructions()}（系统消息），而非对话历史。
-     * 此包装器从 {@link Query#context()} 中取 {@code chat_memory_conversation_id}，
-     * 通过 {@link ChatMemory} 加载真实对话历史，注入到 Query 后再委托给原压缩器。</p>
-     */
-    @Bean
-    public QueryTransformer compressionQueryTransformer(
-            @Qualifier("deepSeekChatModel") ChatModel chatModel,
-            ChatMemory chatMemory) {
-        ChatClient.Builder compressionBuilder = ChatClient.builder(chatModel);
-        CompressionQueryTransformer delegate = CompressionQueryTransformer.builder()
-                .chatClientBuilder(compressionBuilder)
-                .build();
-        return new HistoryEnrichedQueryTransformer(delegate, chatMemory);
-    }
-
-    /**
-     * 检索增强顾问 — 模块化 RAG 的核心 Advisor
-     *
-     * <p>处理流程：</p>
-     * <ol>
-     *   <li>HistoryEnrichedQueryTransformer → CompressionQueryTransformer — 消解指代（如"第二个景点"）</li>
-     *   <li>RewriteQueryTransformer — 口语 query 改写为关键词串（提升召回率）</li>
-     *   <li>SpotDocumentRetriever — 向量检索相关景点文档</li>
-     *   <li>ContextualQueryAugmenter — 将检索到的文档注入 prompt 上下文</li>
-     * </ol>
-     */
-    @Bean
-    public RetrievalAugmentationAdvisor retrievalAugmentationAdvisor(
-            HybridDocumentRetriever spotDocumentRetriever,
-            ContextualQueryAugmenter contextualQueryAugmenter,
-            QueryTransformer rewriteQueryTransformer,
-            QueryTransformer compressionQueryTransformer) {
-        return RetrievalAugmentationAdvisor.builder()
-                .documentRetriever(spotDocumentRetriever)
-                .queryAugmenter(contextualQueryAugmenter)
-                .queryTransformers(compressionQueryTransformer, rewriteQueryTransformer)
-                .build();
-    }
-
-    // ==================== 内部类 ====================
-
-    /**
-     * 为 {@link CompressionQueryTransformer} 注入真实对话历史的包装器。
-     *
-     * <p>Spring AI 1.0.7 的 {@link RetrievalAugmentationAdvisor} 构建的 {@link Query}
-     * 其 {@code history} 来自 {@code Prompt.getInstructions()}（通常为空），
-     * 而 {@code context} 中包含 {@code chat_memory_conversation_id}。
-     * 此包装器利用 context 中的会话 ID 从 {@link ChatMemory} 加载真实历史，
-     * 使压缩 LLM 能正确消解"第二个""第一家"等指代词。</p>
-     */
-    private static class HistoryEnrichedQueryTransformer implements QueryTransformer {
-
-        private static final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(HistoryEnrichedQueryTransformer.class);
-
-        private final CompressionQueryTransformer delegate;
-        private final ChatMemory chatMemory;
-
-        HistoryEnrichedQueryTransformer(CompressionQueryTransformer delegate, ChatMemory chatMemory) {
-            this.delegate = delegate;
-            this.chatMemory = chatMemory;
-        }
-
-        @Override
-        public Query transform(Query query) {
-            log.info(">>> 压缩器收到 query.context() keys: {}", query.context().keySet());
-            log.info(">>> 压缩器收到 query.text(): {}", query.text());
-            log.info(">>> 压缩器收到 query.history() size: {}",
-                    query.history() != null ? query.history().size() : 0);
-
-            String conversationId = (String) query.context().get("chat_memory_conversation_id");
-            log.info(">>> conversationId from context: {}", conversationId);
-
-            if (conversationId == null || conversationId.isEmpty()) {
-                log.warn(">>> 未找到 conversationId，跳过压缩");
-                return delegate.transform(query);
-            }
-
-            List<Message> history = chatMemory.get(conversationId);
-            log.info(">>> ChatMemory 中的历史消息数: {}", history != null ? history.size() : 0);
-            if (history != null && !history.isEmpty()) {
-                for (int i = 0; i < Math.min(history.size(), 4); i++) {
-                    Message m = history.get(i);
-                    log.info(">>>   历史[{}]: {} = {}",
-                            i, m.getMessageType(), m.getText().substring(0, Math.min(80, m.getText().length())));
-                }
-            }
-
-            if (history == null || history.isEmpty()) {
-                log.warn(">>> ChatMemory 中无历史消息，跳过压缩");
-                return delegate.transform(query);
-            }
-
-            Query enriched = query.mutate().history(history).build();
-            Query result = delegate.transform(enriched);
-            log.info(">>> 压缩结果: {} → {}", query.text(), result.text());
-            return result;
-        }
+    public RewriteQueryTransformer rewriteQueryTransformer(
+            @Qualifier("deepSeekChatModel") ChatModel chatModel, RagConfig ragConfig) {
+        return new RewriteQueryTransformer(chatModel, ragConfig.getRewrite().getMinQueryLength());
     }
 
     // ==================== 聊天记忆 ====================
@@ -283,25 +216,19 @@ public class AIConfig {
     // ==================== ChatClient ====================
 
     /**
-     * ChatClient — 组装 Advisor 链 + Function Calling 工具
+     * ChatClient — 仅聊天记忆 + 工具调用。
      *
-     * <p>Advisor 执行顺序（按 order 值从小到大）：</p>
-     * <ol>
-     *   <li>MessageChatMemoryAdvisor — 注入对话历史</li>
-     *   <li>RetrievalAugmentationAdvisor — 压缩查询 → 检索 → 上下文增强</li>
-     *   <li>SimpleLoggerAdvisor — 记录日志</li>
-     * </ol>
-     *
-     * <p>LLM 生成响应时可调用 SpotTools 获取实时数据（价格、优惠券、库存）。</p>
+     * <p>RAG 检索已迁移至 Agent 路径（ReActAgentLoop），
+     * ChatClient 不再承担检索职责，仅用于闲聊/指定景点问答。</p>
      */
     @Bean
     public ChatClient chatClient(@Qualifier("deepSeekChatModel") ChatModel chatModel,
                                   MessageChatMemoryAdvisor memoryAdvisor,
-                                  RetrievalAugmentationAdvisor ragAdvisor,
-                                  SpotTools spotTools) {
+                                  SpotTools spotTools,
+                                  WeatherTools weatherTools) {
         return ChatClient.builder(chatModel)
-                .defaultAdvisors(memoryAdvisor, ragAdvisor, new SimpleLoggerAdvisor())
-                .defaultTools(spotTools)
+                .defaultAdvisors(memoryAdvisor, new SimpleLoggerAdvisor())
+                .defaultTools(spotTools, weatherTools)
                 .build();
     }
 }

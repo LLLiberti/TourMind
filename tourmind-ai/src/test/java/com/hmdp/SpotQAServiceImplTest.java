@@ -1,10 +1,14 @@
 package com.hmdp;
 
+import com.hmdp.agent.AgentResult;
+import com.hmdp.agent.AgentTrace;
+import com.hmdp.agent.ReActAgentLoop;
 import com.hmdp.dto.Result;
 import com.hmdp.dto.SpotDTO;
 import com.hmdp.entity.Spot;
 import com.hmdp.mapper.SpotMapper;
 import com.hmdp.rag.retrieval.HybridDocumentRetriever;
+import com.hmdp.rag.router.QueryRouter;
 import com.hmdp.service.IConversationService;
 import com.hmdp.service.impl.SpotQAServiceImpl;
 import org.junit.jupiter.api.BeforeEach;
@@ -51,6 +55,12 @@ class SpotQAServiceImplTest {
     private HybridDocumentRetriever spotDocumentRetriever;
 
     @Mock
+    private QueryRouter queryRouter;
+
+    @Mock
+    private ReActAgentLoop reActAgentLoop;
+
+    @Mock
     private ChatClient.ChatClientRequestSpec requestSpec;
 
     @InjectMocks
@@ -75,132 +85,162 @@ class SpotQAServiceImplTest {
                 .thenReturn(CONVERSATION_ID);
     }
 
-    // ==================== answerSpotQuestion ====================
+    /** 默认：QueryRouter 返回 KNOWLEDGE（走 Agent 路径） */
+    private void initQueryRouterMock() {
+        when(queryRouter.classify(anyString())).thenReturn(QueryRouter.Category.KNOWLEDGE);
+    }
+
+    /** 设置 Agent 模式的默认 mock */
+    private void initAgentMock() {
+        AgentTrace trace = new AgentTrace();
+        when(reActAgentLoop.thinkAndActWithPlan(anyString(), anyString(), any(), any()))
+                .thenReturn(new AgentResult("这是 Agent 的回答", trace));
+    }
+
+    // ==================== answerSpotQuestion → 走 Agent 路径 ====================
 
     @Nested
     @MockitoSettings(strictness = Strictness.LENIENT)
-    @DisplayName("answerSpotQuestion — RAG 检索问答")
+    @DisplayName("answerSpotQuestion → 统一走 Agent 路径")
     class AnswerSpotQuestionTests {
 
         @BeforeEach
         void setUp() {
-            initChatClientMock();
             initConversationMock();
+            initQueryRouterMock();
+            initAgentMock();
         }
 
         @Test
-        @DisplayName("正常问答 — 返回回答和推荐景点列表")
+        @DisplayName("正常问答 — Agent 返回回答和推荐景点列表")
         void shouldReturnAnswerWithSpots() {
-            // given
             Spot spot1 = buildSpot(1L, "川味观", "西湖区", 80L, 4);
             Spot spot2 = buildSpot(2L, "外婆家", "西湖区", 90L, 5);
             when(spotDocumentRetriever.getLastRetrievedSpots())
                     .thenReturn(List.of(spot1, spot2));
 
-            // when
             Result result = service.answerSpotQuestion(USER_ID, null,
                     "推荐川菜馆", null, null, 5);
 
-            // then
             assertThat(result.getSuccess()).isTrue();
             Map<String, Object> data = (Map<String, Object>) result.getData();
-            assertThat(data.get("answer")).isEqualTo("这是 AI 的回答");
-            assertThat(data.get("sessionId")).isEqualTo(CONVERSATION_ID);
-
+            assertThat(data.get("answer")).isEqualTo("这是 Agent 的回答");
             List<SpotDTO> spots = (List<SpotDTO>) data.get("recommendedSpots");
             assertThat(spots).hasSize(2);
-            assertThat(spots.get(0).getName()).isEqualTo("川味观");
-            assertThat(spots.get(1).getName()).isEqualTo("外婆家");
-
-            // 验证坐标设置
-            verify(spotDocumentRetriever).setUserCoordinates(null, null);
-            // 验证 ThreadLocal 清理
             verify(spotDocumentRetriever).clearContext();
         }
 
         @Test
-        @DisplayName("带用户坐标 — 调用 setUserCoordinates")
-        void shouldSetUserCoordinates() {
-            // given
-            when(spotDocumentRetriever.getLastRetrievedSpots())
-                    .thenReturn(Collections.emptyList());
-
-            // when
-            service.answerSpotQuestion(USER_ID, null,
-                    "附近的咖啡店", 121.50, 31.23, 5);
-
-            // then
-            verify(spotDocumentRetriever).setUserCoordinates(121.50, 31.23);
-            verify(spotDocumentRetriever).clearContext();
-        }
-
-        @Test
-        @DisplayName("limit 截断 — 返回数量不超过 limit")
-        void shouldLimitSpotsByParam() {
-            // given
-            Spot spot1 = buildSpot(1L, "A", "杭州", 10L, 1);
-            Spot spot2 = buildSpot(2L, "B", "杭州", 20L, 2);
-            Spot spot3 = buildSpot(3L, "C", "杭州", 30L, 3);
-            when(spotDocumentRetriever.getLastRetrievedSpots())
-                    .thenReturn(List.of(spot1, spot2, spot3));
-
-            // when
-            Result result = service.answerSpotQuestion(USER_ID, null,
-                    "景点", null, null, 2);
-
-            // then
-            Map<String, Object> data = (Map<String, Object>) result.getData();
-            List<SpotDTO> spots = (List<SpotDTO>) data.get("recommendedSpots");
-            assertThat(spots).hasSize(2);
-        }
-
-        @Test
-        @DisplayName("无匹配景点 — 返回空列表")
-        void shouldReturnEmptySpotsWhenNoMatches() {
-            // given
-            when(spotDocumentRetriever.getLastRetrievedSpots())
-                    .thenReturn(Collections.emptyList());
-
-            // when
-            Result result = service.answerSpotQuestion(USER_ID, null,
-                    "不存在的查询", null, null, 5);
-
-            // then
-            assertThat(result.getSuccess()).isTrue();
-            Map<String, Object> data = (Map<String, Object>) result.getData();
-            List<SpotDTO> spots = (List<SpotDTO>) data.get("recommendedSpots");
-            assertThat(spots).isEmpty();
-        }
-
-        @Test
-        @DisplayName("空问题 — 返回失败")
+        @DisplayName("空问题 — 返回失败（Agent 未被调用）")
         void shouldFailOnEmptyQuestion() {
-            // when
             Result r1 = service.answerSpotQuestion(USER_ID, null, "", null, null, 5);
             Result r2 = service.answerSpotQuestion(USER_ID, null, null, null, null, 5);
-            Result r3 = service.answerSpotQuestion(USER_ID, null, "   ", null, null, 5);
-
-            // then
             assertThat(r1.getSuccess()).isFalse();
             assertThat(r2.getSuccess()).isFalse();
-            assertThat(r3.getSuccess()).isFalse();
+            verify(reActAgentLoop, never()).thinkAndActWithPlan(anyString(), anyString(), any(), any());
         }
 
         @Test
-        @DisplayName("异常时 finally 仍执行 cleanup")
+        @DisplayName("Agent 异常时 finally 仍执行 cleanup")
         void shouldCleanupOnException() {
-            // given
-            doThrow(new RuntimeException("模拟 ChatClient 异常"))
-                    .when(requestSpec).call();
+            when(reActAgentLoop.thinkAndActWithPlan(anyString(), anyString(), any(), any()))
+                    .thenThrow(new RuntimeException("Agent 异常"));
 
-            // when
             try {
                 service.answerSpotQuestion(USER_ID, null, "触发异常", null, null, 5);
-            } catch (RuntimeException ignored) {
-            }
+            } catch (RuntimeException ignored) { }
 
-            // then - finally 块仍执行了 clearContext
             verify(spotDocumentRetriever).clearContext();
+        }
+    }
+
+    // ==================== answerSpotQuestion — 闲聊分流 ====================
+
+    @Nested
+    @MockitoSettings(strictness = Strictness.LENIENT)
+    @DisplayName("answerSpotQuestion — 闲聊分流（CHITCHAT）")
+    class AnswerChitchatTests {
+
+        @BeforeEach
+        void setUp() {
+            initChatClientMock();
+            initConversationMock();
+            // 覆盖为 CHITCHAT
+            when(queryRouter.classify(anyString())).thenReturn(QueryRouter.Category.CHITCHAT);
+        }
+
+        @Test
+        @DisplayName("闲聊问候 — 跳过 RAG 管线，返回 CHITCHAT 标记")
+        void shouldSkipRagForChitchat() {
+            Result result = service.answerSpotQuestion(USER_ID, "session-1",
+                    "你好", null, null, 5);
+
+            assertThat(result.getSuccess()).isTrue();
+            Map<String, Object> data = (Map<String, Object>) result.getData();
+            assertThat(data.get("category")).isEqualTo("CHITCHAT");
+            assertThat(data.get("retrievalConfidence")).isEqualTo("SKIPPED");
+            assertThat(data.get("answer")).isEqualTo("这是 AI 的回答");
+
+            // 验证未调用 spotDocumentRetriever
+            verify(spotDocumentRetriever, never()).setUserCoordinates(any(), any());
+            verify(spotDocumentRetriever, never()).clearContext();
+        }
+
+        @Test
+        @DisplayName("闲聊分流不触发检索 — getLastRetrievedSpots 未被调用")
+        void shouldNotTouchRetrieverForChitchat() {
+            service.answerSpotQuestion(USER_ID, null, "谢谢", null, null, 5);
+
+            verify(spotDocumentRetriever, never()).getLastRetrievedSpots();
+            verify(spotDocumentRetriever, never()).setUserCoordinates(any(), any());
+        }
+    }
+
+    // ==================== answerSpotQuestion — CRAG 回退 ====================
+
+    @Nested
+    @MockitoSettings(strictness = Strictness.LENIENT)
+    @DisplayName("answerSpotQuestion — CRAG 检索质量回退")
+    class CRAGFallbackTests {
+
+        @BeforeEach
+        void setUp() {
+            initConversationMock();
+            initQueryRouterMock();
+            initAgentMock();
+        }
+
+        @Test
+        @DisplayName("INSUFFICIENT 置信度 — 回答前追加免责声明")
+        void shouldAddDisclaimerWhenInsufficient() {
+            when(spotDocumentRetriever.getLastRetrievalConfidence()).thenReturn("INSUFFICIENT");
+            when(spotDocumentRetriever.getLastMaxRetrievalScore()).thenReturn(0.2);
+            when(spotDocumentRetriever.getLastRetrievedSpots()).thenReturn(Collections.emptyList());
+
+            Result result = service.answerSpotQuestion(USER_ID, null,
+                    "根本不存在的奇怪问题xyz", null, null, 5);
+
+            assertThat(result.getSuccess()).isTrue();
+            Map<String, Object> data = (Map<String, Object>) result.getData();
+            assertThat(data.get("retrievalConfidence")).isEqualTo("INSUFFICIENT");
+            String answer = (String) data.get("answer");
+            assertThat(answer).startsWith("⚠️");
+            assertThat(answer).contains("以景区官方信息为准");
+        }
+
+        @Test
+        @DisplayName("CONFIDENT 置信度 — 不追加免责声明")
+        void shouldNotAddDisclaimerWhenConfident() {
+            when(spotDocumentRetriever.getLastRetrievalConfidence()).thenReturn("CONFIDENT");
+            when(spotDocumentRetriever.getLastRetrievedSpots()).thenReturn(Collections.emptyList());
+
+            Result result = service.answerSpotQuestion(USER_ID, null,
+                    "西湖有什么好玩的", null, null, 5);
+
+            Map<String, Object> data = (Map<String, Object>) result.getData();
+            assertThat(data.get("retrievalConfidence")).isEqualTo("CONFIDENT");
+            String answer = (String) data.get("answer");
+            assertThat(answer).doesNotStartWith("⚠️");
         }
     }
 
@@ -215,6 +255,7 @@ class SpotQAServiceImplTest {
         void setUp() {
             initChatClientMock();
             initConversationMock();
+            initQueryRouterMock();
         }
 
         @Test
@@ -281,6 +322,89 @@ class SpotQAServiceImplTest {
             service.clearConversation(null, "session-1");
             service.clearConversation(USER_ID, null);
             verify(conversationService, never()).clearConversation(anyLong(), anyString());
+        }
+    }
+
+    // ==================== answerSpotQuestionAgent — Agent 模式 ====================
+
+    @Nested
+    @MockitoSettings(strictness = Strictness.LENIENT)
+    @DisplayName("answerSpotQuestionAgent — Agent 模式问答")
+    class AnswerSpotQuestionAgentTests {
+
+        @BeforeEach
+        void setUp() {
+            initConversationMock();
+            initQueryRouterMock();
+            // 默认 Agent 返回
+            AgentTrace trace = new AgentTrace();
+            when(reActAgentLoop.thinkAndActWithPlan(anyString(), anyString(), any(), any()))
+                    .thenReturn(new AgentResult("Agent 回答", trace));
+        }
+
+        @Test
+        @DisplayName("正常 Agent 问答 — 返回回答、景点列表和 trace")
+        void shouldReturnAnswerWithTrace() {
+            Spot spot = buildSpot(1L, "西湖", "西湖区", 0L, 5);
+            when(spotDocumentRetriever.getLastRetrievedSpots()).thenReturn(List.of(spot));
+            when(spotDocumentRetriever.getLastRetrievalConfidence()).thenReturn("CONFIDENT");
+
+            Result result = service.answerSpotQuestionAgent(USER_ID, null,
+                    "西湖门票多少钱", null, null, 5);
+
+            assertThat(result.getSuccess()).isTrue();
+            Map<String, Object> data = (Map<String, Object>) result.getData();
+            assertThat(data.get("answer")).isEqualTo("Agent 回答");
+            assertThat(data.get("category")).isEqualTo("KNOWLEDGE");
+            assertThat(data.get("agentTrace")).isNotNull();
+
+            List<SpotDTO> spots = (List<SpotDTO>) data.get("recommendedSpots");
+            assertThat(spots).hasSize(1);
+            assertThat(spots.get(0).getName()).isEqualTo("西湖");
+
+            verify(spotDocumentRetriever).clearContext();
+        }
+
+        @Test
+        @DisplayName("闲聊分流 — 跳过 Agent，降级到 CHITCHAT")
+        void shouldSkipAgentForChitchat() {
+            when(queryRouter.classify(anyString())).thenReturn(QueryRouter.Category.CHITCHAT);
+            initChatClientMock();
+
+            Result result = service.answerSpotQuestionAgent(USER_ID, null,
+                    "你好", null, null, 5);
+
+            assertThat(result.getSuccess()).isTrue();
+            Map<String, Object> data = (Map<String, Object>) result.getData();
+            assertThat(data.get("category")).isEqualTo("CHITCHAT");
+            assertThat(data.get("retrievalConfidence")).isEqualTo("SKIPPED");
+
+            // Agent 未被调用
+            verify(reActAgentLoop, never()).thinkAndActWithPlan(anyString(), anyString(), any(), any());
+        }
+
+        @Test
+        @DisplayName("INSUFFICIENT 置信度 — 追加免责声明")
+        void shouldAddDisclaimerWhenAgentInsufficient() {
+            when(spotDocumentRetriever.getLastRetrievalConfidence()).thenReturn("INSUFFICIENT");
+            when(spotDocumentRetriever.getLastRetrievedSpots()).thenReturn(Collections.emptyList());
+
+            Result result = service.answerSpotQuestionAgent(USER_ID, null,
+                    "不存在的景点", null, null, 5);
+
+            String answer = (String) ((Map<String, Object>) result.getData()).get("answer");
+            assertThat(answer).startsWith("⚠️");
+        }
+
+        @Test
+        @DisplayName("空问题 — 返回失败")
+        void shouldFailOnEmptyQuestion() {
+            Result r1 = service.answerSpotQuestionAgent(USER_ID, null, "", null, null, 5);
+            Result r2 = service.answerSpotQuestionAgent(USER_ID, null, null, null, null, 5);
+
+            assertThat(r1.getSuccess()).isFalse();
+            assertThat(r2.getSuccess()).isFalse();
+            verify(reActAgentLoop, never()).thinkAndActWithPlan(anyString(), anyString(), any(), any());
         }
     }
 

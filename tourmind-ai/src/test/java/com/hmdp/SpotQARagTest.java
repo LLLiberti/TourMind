@@ -53,7 +53,6 @@ class SpotQARagTest {
         System.out.println("\n" + "=".repeat(60));
         System.out.println("【场景一】基本问答 — 首次使用，不传 sessionId");
         System.out.println("=".repeat(60));
-
         System.out.println("\n👤 用户" + USER_A + " 提问: \"杭州有什么值得去的自然风景区？\"");
 
         Result result = spotQAService.answerSpotQuestion(USER_A, null, "杭州有什么值得去的自然风景区？", null, null, 5);

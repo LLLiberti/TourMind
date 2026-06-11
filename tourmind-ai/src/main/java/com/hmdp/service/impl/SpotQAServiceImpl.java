@@ -1,10 +1,13 @@
 package com.hmdp.service.impl;
 
+import com.hmdp.agent.AgentResult;
+import com.hmdp.agent.ReActAgentLoop;
 import com.hmdp.dto.Result;
 import com.hmdp.dto.SpotDTO;
 import com.hmdp.entity.Spot;
 import com.hmdp.mapper.SpotMapper;
 import com.hmdp.rag.retrieval.HybridDocumentRetriever;
+import com.hmdp.rag.router.QueryRouter;
 import com.hmdp.service.IConversationService;
 import com.hmdp.service.ISpotQAService;
 import lombok.extern.slf4j.Slf4j;
@@ -16,27 +19,27 @@ import java.util.*;
 import java.util.stream.Collectors;
 
 /**
- * 智能景点问答服务实现 — 基于 Spring AI 模块化 RAG 架构
+ * 智能景点问答服务实现 — Agentic RAG 架构。
  *
  * <h3>架构</h3>
  * <ol>
- *   <li><b>普通问答（向量检索）</b>：ChatClient + MessageChatMemoryAdvisor + RetrievalAugmentationAdvisor</li>
+ *   <li><b>Agent 模式问答</b>：ReActAgentLoop（LLM 自主决策检索+工具调用）</li>
  *   <li><b>指定景点问答</b>：ChatClient + MessageChatMemoryAdvisor（手工构建上下文，无需检索）</li>
  * </ol>
  *
  * <h3>核心流程</h3>
  * <pre>
  * answerSpotQuestion(userId, sessionId, question, x, y):
- *   1. 获取/创建会话
- *   2. 设置用户坐标 → SpotDocumentRetriever
- *   3. ChatClient.prompt().user(question).call() → Advisor 链自动处理检索+记忆
- *   4. 从 SpotDocumentRetriever 提取 Spots → 构建 DTO
- *   5. finally 清理 ThreadLocal
+ *   → 委托到 answerSpotQuestionAgent:
+ *     1. 获取/创建会话 → QueryRouter 分流（闲聊跳过）
+ *     2. ReActAgentLoop.thinkAndActWithPlan() → Planner 分解 → ReACT 循环 → 工具调用
+ *     3. 从 HybridDocumentRetriever 提取 Spots → 构建 DTO
+ *     4. finally 清理 ThreadLocal
  *
  * answerQuestionAboutSpot(userId, sessionId, spotId, question):
  *   1. 获取/创建会话
  *   2. DB 查询指定 Spot → 手动构建上下文 prompt
- *   3. ChatClient.prompt().user(contextPrompt).call() → MessageChatMemoryAdvisor 处理记忆
+ *   3. ChatClient.prompt().user(contextPrompt).call()
  *   4. 返回结果
  * </pre>
  */
@@ -65,55 +68,104 @@ public class SpotQAServiceImpl implements ISpotQAService {
     @Resource
     private HybridDocumentRetriever spotDocumentRetriever;
 
-    // ==================== 普通问答（RAG 检索） ====================
+    @Resource
+    private QueryRouter queryRouter;
+
+    @Resource
+    private ReActAgentLoop reActAgentLoop;
+
+    // ==================== 普通问答 → 统一走 Agent 路径 ====================
 
     @Override
     public Result answerSpotQuestion(Long userId, String sessionId, String question,
                                       Double userX, Double userY, int limit) {
+        // 统一委托到 Agent 模式 — RAG 检索和工具调用均由 LLM 自主决策
+        return answerSpotQuestionAgent(userId, sessionId, question, userX, userY, limit);
+    }
+
+    // ==================== Agent 模式问答 ====================
+
+    @Override
+    public Result answerSpotQuestionAgent(Long userId, String sessionId, String question,
+                                          Double userX, Double userY, int limit) {
         if (question == null || question.isBlank()) {
             return Result.fail("问题不能为空");
         }
 
-        // 1. 获取或创建会话
         String conversationId = conversationService.getOrCreateConversation(userId, sessionId);
 
-        // 2. 设置用户坐标（SpotDocumentRetriever 内部会进行距离排序）
-        spotDocumentRetriever.setUserCoordinates(userX, userY);
+        // Adaptive 分流 — 闲聊跳过 Agent，复用现有闲聊路径
+        QueryRouter.Category category = queryRouter.classify(question);
+        log.info("Agent 分流: query='{}' → category={}", question, category);
+
+        if (category == QueryRouter.Category.CHITCHAT) {
+            return answerChitchat(question, conversationId, limit);
+        }
 
         try {
-            // 3. 调用 ChatClient — Advisor 链自动处理：
-            //    a) MessageChatMemoryAdvisor: 注入对话历史
-            //    b) RetrievalAugmentationAdvisor: SpotDocumentRetriever 检索 + ContextualQueryAugmenter 注入上下文
-            //    c) SimpleLoggerAdvisor: 日志记录
-            //    将用户坐标注入到 prompt 中，使 LLM 能基于位置回答
-            String promptText = buildPromptWithCoordinates(question, userX, userY);
-            String answer = chatClient.prompt()
-                    .advisors(a -> a.param("chat_memory_conversation_id", conversationId))
-                    .user(promptText)
-                    .call()
-                    .content();
+            // 执行 ReACT Agent 循环
+            AgentResult agentResult = reActAgentLoop.thinkAndActWithPlan(
+                    question, conversationId, userX, userY);
+            String answer = agentResult.answer();
 
-            // 4. 递增消息计数
+            log.info("Agent trace: {} steps, hitMaxIterations={}",
+                    agentResult.trace().getTotalIterations(),
+                    agentResult.trace().isHitMaxIterations());
+
+            // CRAG 评估 — 从 ThreadLocal 读取（Agent 调用 searchKnowledgeBase 后写入）
+            String confidence = spotDocumentRetriever.getLastRetrievalConfidence();
+            if ("INSUFFICIENT".equals(confidence)) {
+                answer = "⚠️ 以下信息基于一般知识，建议以景区官方信息为准。\n\n" + answer;
+            }
+
             conversationService.incrementMessageCount(conversationId);
 
-            // 5. 从 SpotDocumentRetriever 提取检索到的景点（已排序）
+            // 构建响应
             List<Spot> retrievedSpots = spotDocumentRetriever.getLastRetrievedSpots();
-
-            // 6. 构建响应
+            Map<Long, Double> distanceMap = spotDocumentRetriever.getLastSpotDistances();
             List<SpotDTO> spotDTOs = retrievedSpots.stream()
                     .limit(limit)
-                    .map(SpotDTO::from)
+                    .map(spot -> {
+                        SpotDTO dto = SpotDTO.from(spot);
+                        Double dist = distanceMap.get(spot.getId());
+                        if (dist != null) dto.setDistance(dist);
+                        return dto;
+                    })
                     .collect(Collectors.toList());
 
-            return Result.ok(Map.of(
-                    "answer", answer,
-                    "sessionId", conversationId,
-                    "recommendedSpots", spotDTOs
-            ));
+            Map<String, Object> resultMap = new LinkedHashMap<>();
+            resultMap.put("answer", answer);
+            resultMap.put("sessionId", conversationId);
+            resultMap.put("recommendedSpots", spotDTOs);
+            resultMap.put("category", category.name());
+            resultMap.put("retrievalConfidence", confidence != null ? confidence : "UNKNOWN");
+            resultMap.put("agentTrace", agentResult.trace());
+            return Result.ok(resultMap);
+
         } finally {
-            // 7. 清理 ThreadLocal，防止内存泄漏
             spotDocumentRetriever.clearContext();
         }
+    }
+
+    /**
+     * 闲聊/问候 → 直接 LLM 回答，完全跳过 RAG 检索管线。
+     */
+    private Result answerChitchat(String question, String conversationId, int limit) {
+        String answer = chatClient.prompt()
+                .advisors(a -> a.param("chat_memory_conversation_id", conversationId))
+                .user("请简洁友好地回应以下用户消息（你是景点推荐助手）：" + question)
+                .call()
+                .content();
+
+        conversationService.incrementMessageCount(conversationId);
+
+        return Result.ok(Map.of(
+                "answer", answer,
+                "sessionId", conversationId,
+                "recommendedSpots", Collections.emptyList(),
+                "category", "CHITCHAT",
+                "retrievalConfidence", "SKIPPED"
+        ));
     }
 
     // ==================== 指定景点问答（无须 RAG 检索） ====================
@@ -180,17 +232,6 @@ public class SpotQAServiceImpl implements ISpotQAService {
     // ==================== 内部方法 ====================
 
     /**
-     * 构建包含用户坐标的 prompt 文本，使 LLM 能基于位置回答
-     */
-    private String buildPromptWithCoordinates(String question, Double userX, Double userY) {
-        if (userX != null && userY != null) {
-            return String.format("（当前用户位于经度 %.4f、纬度 %.4f 的位置，请优先推荐距离近的景点）%s",
-                    userX, userY, question);
-        }
-        return question;
-    }
-
-    /**
      * 构建景点上下文文本（仅用于指定景点问答场景）。
      *
      * <p><b>注意：不包含门票价格。</b>价格等实时数据由 Function Calling 工具提供。</p>
@@ -200,6 +241,7 @@ public class SpotQAServiceImpl implements ISpotQAService {
         for (int i = 0; i < spots.size(); i++) {
             Spot spot = spots.get(i);
             sb.append(String.format("【景点%d】\n", i + 1));
+            sb.append(String.format("景点ID：%d\n", spot.getId()));
             sb.append(String.format("名称：%s\n", spot.getName()));
             sb.append(String.format("地址：%s %s\n",
                     spot.getArea() != null ? spot.getArea() : "",

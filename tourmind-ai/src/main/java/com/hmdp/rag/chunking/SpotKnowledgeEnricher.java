@@ -26,7 +26,11 @@ import com.hmdp.entity.Spot;
  *
  * [开放须知]
  * 开放时间：全天
+ *
+ * [景点特色]
+ * 湖光山色冠绝天下...
  * }</pre>
+ * <p><b>注意：购票须知和退票条件不写入主知识库，由 TicketRefundEnricher 写入退购票专项知识库。</b></p>
  */
 public class SpotKnowledgeEnricher {
 
@@ -65,6 +69,15 @@ public class SpotKnowledgeEnricher {
         } else {
             sb.append("开放时间：请咨询景区\n");
         }
+
+        // [景点特色] — 核心亮点描述
+        if (spot.getFeatures() != null && !spot.getFeatures().isEmpty()) {
+            sb.append("\n[景点特色]\n");
+            sb.append(spot.getFeatures()).append("\n");
+        }
+
+        // 注意：购票须知和退票条件不在此处写入，
+        // 由 TicketRefundEnricher 独立构建，存入退购票专项知识库
 
         return sb.toString();
     }

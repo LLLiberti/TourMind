@@ -23,7 +23,7 @@ import java.util.List;
  * <h3>在管线中的位置</h3>
  * <p>位于 {@code CompressionQueryTransformer}（多轮指代消解）<b>之后</b>：</p>
  * <pre>
- * CompressionQueryTransformer → RewriteQueryTransformer → SpotDocumentRetriever
+ * CompressionQueryTransformer → RewriteQueryTransformer → HybridDocumentRetriever
  * </pre>
  * <p>这样确保指代消解（如"第二个景点"→"雷峰塔"）先完成，再对完整查询进行关键词改写。</p>
  *
@@ -56,9 +56,11 @@ public class RewriteQueryTransformer implements QueryTransformer {
     private static final int MIN_KEYWORD_LENGTH = 3;
 
     private final ChatModel chatModel;
+    private final int minQueryLength;
 
-    public RewriteQueryTransformer(ChatModel chatModel) {
+    public RewriteQueryTransformer(ChatModel chatModel, int minQueryLength) {
         this.chatModel = chatModel;
+        this.minQueryLength = minQueryLength;
     }
 
     @Override
@@ -68,9 +70,9 @@ public class RewriteQueryTransformer implements QueryTransformer {
             return query;
         }
 
-        // 如果 query 本身已经很短（≤5 个字符），可能已经是关键词，直接透传
-        if (originalText.trim().length() <= 5) {
-            log.debug("Query 过短（{} 字符），跳过改写: {}", originalText.length(), originalText);
+        // 如果 query 本身已经很短（≤ 配置阈值），可能已经是关键词，直接透传
+        if (originalText.trim().length() <= minQueryLength) {
+            log.debug("Query 过短（{} ≤ {} 字符），跳过改写: {}", originalText.length(), minQueryLength, originalText);
             return query;
         }
 

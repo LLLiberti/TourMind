@@ -7,6 +7,8 @@ import com.hmdp.mapper.SpotMapper;
 import com.hmdp.mapper.SpotTypeMapper;
 import com.hmdp.rag.RetrievalContext;
 import com.hmdp.rag.client.QwenRerankClient;
+import com.hmdp.rag.evaluation.RetrievalEvaluator;
+import com.hmdp.rag.router.TicketRefundConstants;
 import com.hmdp.rag.index.ParentChildIndexer;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
@@ -23,20 +25,21 @@ import java.util.function.Function;
 import java.util.stream.Collectors;
 
 /**
- * 混合文档检索器 — ES BM25 + Qdrant 向量 + RRF 融合 + 可选重排。
+ * 混合文档检索器 — 主知识库 + 退购票知识库，ES BM25 + Qdrant 向量 + RRF 融合 + 可选重排。
  *
  * <h3>检索管线</h3>
  * <ol>
- *   <li>Qdrant 向量检索 — 仅在子文档（docType="child"）中搜索</li>
- *   <li>ES BM25 关键词检索 — ik_max_word 中文分词</li>
- *   <li>RRF 排名融合 — 两路排名结果合并排序</li>
- *   <li>[可选] qwen3-rerank 两阶段精排 + 阈值过滤</li>
- *   <li>提取 spotId → DB 批量查询 → 距离排序 → ThreadLocal 缓存</li>
- *   <li>加载父文档全文（Redis → MySQL → 重建）→ 返回 Documents</li>
+ *   <li><b>意图路由</b> — 关键词匹配判断是否需搜退购票知识库</li>
+ *   <li><b>主知识库</b>：Qdrant 向量（仅子文档）→ ES BM25 → RRF 融合 → 可选重排
+ *       → DB批量查询 → 距离排序 → 父文档加载</li>
+ *   <li><b>退购票知识库</b>（按需）：Qdrant 向量 → ES BM25 → RRF 融合 → 附加到结果</li>
+ *   <li>合并去重（spotId + chunkTopic）→ 返回 Documents</li>
  * </ol>
  */
 @Slf4j
 public class HybridDocumentRetriever implements DocumentRetriever {
+
+    // 退购票意图路由 → 引用 TicketRefundConstants（唯一真相源）
 
     private final VectorStore vectorStore;
     private final SpotMapper spotMapper;
@@ -46,6 +49,13 @@ public class HybridDocumentRetriever implements DocumentRetriever {
     private final RrfRankFuser rrfRankFuser;
     private final ParentChildIndexer parentChildIndexer;
     private final QwenRerankClient rerankClient;
+
+    /** 退购票知识库组件（可选） */
+    private final VectorStore ticketRefundVectorStore;
+    private final EsBm25Retriever ticketRefundEsBm25Retriever;
+
+    /** CRAG 检索质量评估器 */
+    private final RetrievalEvaluator retrievalEvaluator;
 
     /** typeId → typeName 本地缓存 */
     private final ConcurrentHashMap<Long, String> typeNameCache = new ConcurrentHashMap<>();
@@ -60,7 +70,10 @@ public class HybridDocumentRetriever implements DocumentRetriever {
                                     EsBm25Retriever esBm25Retriever,
                                     RrfRankFuser rrfRankFuser,
                                     ParentChildIndexer parentChildIndexer,
-                                    QwenRerankClient rerankClient) {
+                                    QwenRerankClient rerankClient,
+                                    VectorStore ticketRefundVectorStore,
+                                    EsBm25Retriever ticketRefundEsBm25Retriever,
+                                    RetrievalEvaluator retrievalEvaluator) {
         this.vectorStore = vectorStore;
         this.spotMapper = spotMapper;
         this.spotTypeMapper = spotTypeMapper;
@@ -69,6 +82,9 @@ public class HybridDocumentRetriever implements DocumentRetriever {
         this.rrfRankFuser = rrfRankFuser;
         this.parentChildIndexer = parentChildIndexer;
         this.rerankClient = rerankClient;
+        this.ticketRefundVectorStore = ticketRefundVectorStore;
+        this.ticketRefundEsBm25Retriever = ticketRefundEsBm25Retriever;
+        this.retrievalEvaluator = retrievalEvaluator;
     }
 
     @PostConstruct
@@ -87,17 +103,52 @@ public class HybridDocumentRetriever implements DocumentRetriever {
         String queryText = query.text();
         log.debug("HybridDocumentRetriever.retrieve() 开始: query={}", queryText);
 
-        RagConfig.RrfConfig rrfConfig = ragConfig.getRrf();
+        // ① 意图路由：判断是否需要搜退购票知识库
+        boolean needTicketRefund = isTicketRefundQuery(queryText);
+        log.debug("意图路由: needTicketRefund={}", needTicketRefund);
+
+        // ==================== 主知识库检索 ====================
+        List<Document> mainDocs = retrieveMainKB(queryText);
+        log.debug("主知识库检索返回 {} 个文档", mainDocs.size());
+
+        // ==================== 退购票知识库检索（按需） ====================
+        List<Document> ticketRefundDocs = Collections.emptyList();
+        if (needTicketRefund && ticketRefundVectorStore != null && ticketRefundEsBm25Retriever != null) {
+            ticketRefundDocs = retrieveTicketRefundKB(queryText);
+            log.debug("退购票知识库检索返回 {} 个文档", ticketRefundDocs.size());
+        }
+
+        // ==================== 合并去重 ====================
+        List<Document> merged = mergeDocuments(mainDocs, ticketRefundDocs);
+
+        // ==================== CRAG 检索评估 ====================
+        RetrievalEvaluator.EvaluationResult evalResult = retrievalEvaluator.evaluate(merged);
+        RetrievalContext ctx = contextHolder.get();
+        if (ctx == null) {
+            ctx = new RetrievalContext();
+            contextHolder.set(ctx);
+        }
+        ctx.setRetrievalConfidence(evalResult.getConfidence().name());
+        ctx.setMaxRetrievalScore(evalResult.getMaxScore());
+        log.debug("CRAG 评估: confidence={}, maxScore={}", evalResult.getConfidence(), evalResult.getMaxScore());
+
+        log.debug("HybridDocumentRetriever.retrieve() 完成，合并输出 {} 个文档", merged.size());
+        return merged;
+    }
+
+    // ==================== 主知识库检索管线 ====================
+
+    private List<Document> retrieveMainKB(String queryText) {
         RagConfig.EsConfig esConfig = ragConfig.getEs();
         int maxContextSpots = ragConfig.getMaxContextSpots();
 
         // ① Qdrant 向量检索（仅子文档）
         List<Document> vectorDocs = vectorSearch(queryText, esConfig.getTopK());
-        log.debug("Qdrant 向量检索命中 {} 条", vectorDocs.size());
+        log.debug("主KB Qdrant 检索命中 {} 条", vectorDocs.size());
 
         // ② ES BM25 关键词检索
         List<RrfRankFuser.ScoredDoc> esResults = esBm25Retriever.search(queryText, esConfig.getTopK());
-        log.debug("ES BM25 检索命中 {} 条", esResults.size());
+        log.debug("主KB ES BM25 检索命中 {} 条", esResults.size());
 
         // 如果两路都为空，返回空
         if (vectorDocs.isEmpty() && esResults.isEmpty()) {
@@ -105,13 +156,21 @@ public class HybridDocumentRetriever implements DocumentRetriever {
             return Collections.emptyList();
         }
 
+        return buildMainResults(queryText, vectorDocs, esResults, maxContextSpots);
+    }
+
+    private List<Document> buildMainResults(String queryText, List<Document> vectorDocs,
+                                             List<RrfRankFuser.ScoredDoc> esResults,
+                                             int maxContextSpots) {
+        RagConfig.RrfConfig rrfConfig = ragConfig.getRrf();
+
         // ③ 转换为统一 ScoredDoc 格式
         List<RrfRankFuser.ScoredDoc> vecScored = fromVectorResults(vectorDocs);
 
         // ④ RRF 排名融合
         List<RrfRankFuser.FusedResult> fused = rrfRankFuser.fuse(
                 esResults, vecScored, rrfConfig.getTopK());
-        log.debug("RRF 融合: {} 个候选", fused.size());
+        log.debug("主KB RRF 融合: {} 个候选", fused.size());
 
         // ⑤ 重排（可选）
         if (rerankClient != null && ragConfig.getReranker().isEnabled()) {
@@ -157,12 +216,111 @@ public class HybridDocumentRetriever implements DocumentRetriever {
         ctx.setRetrievedSpots(orderedSpots);
 
         // ⑩ 加载父文档全文 → 构造返回 Document
-        List<Document> enrichedDocs = orderedSpots.stream()
+        return orderedSpots.stream()
                 .map(this::spotToParentDocument)
                 .collect(Collectors.toList());
+    }
 
-        log.debug("HybridDocumentRetriever.retrieve() 完成，输出 {} 个文档", enrichedDocs.size());
-        return enrichedDocs;
+    // ==================== 退购票知识库检索管线 ====================
+
+    /**
+     * 退购票知识库检索 — 与主 KB 相同的管线但更轻量（无父文档加载）。
+     */
+    private List<Document> retrieveTicketRefundKB(String queryText) {
+        RagConfig.TicketRefundConfig trConfig = ragConfig.getTicketRefund();
+        int topK = trConfig.getEs().getTopK();
+
+        // 向量检索
+        List<Document> vectorDocs = ticketRefundVectorSearch(queryText, topK);
+        log.debug("退购票KB Qdrant 检索命中 {} 条", vectorDocs.size());
+
+        // BM25 检索
+        List<RrfRankFuser.ScoredDoc> esResults = ticketRefundEsBm25Retriever.search(queryText, topK);
+        log.debug("退购票KB ES BM25 检索命中 {} 条", esResults.size());
+
+        if (vectorDocs.isEmpty() && esResults.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        // 转换 + RRF 融合
+        List<RrfRankFuser.ScoredDoc> vecScored = fromVectorResults(vectorDocs);
+        List<RrfRankFuser.FusedResult> fused = rrfRankFuser.fuse(
+                esResults, vecScored, ragConfig.getRrf().getTopK());
+
+        // 转换为 Document（直接用 chunk 文本，无需父文档加载）
+        return fused.stream()
+                .map(fr -> new Document(fr.getText(), fr.getMetadata()))
+                .collect(Collectors.toList());
+    }
+
+    /**
+     * 退购票知识库向量检索。
+     */
+    private List<Document> ticketRefundVectorSearch(String queryText, int topK) {
+        try {
+            SearchRequest request = SearchRequest.builder()
+                    .query(queryText)
+                    .topK(topK)
+                    .similarityThreshold(ragConfig.getSimilarityThreshold())
+                    .build();
+            return ticketRefundVectorStore.similaritySearch(request);
+        } catch (Exception e) {
+            log.error("退购票KB Qdrant 检索异常: {}", e.getMessage(), e);
+            return Collections.emptyList();
+        }
+    }
+
+    // ==================== 意图路由 ====================
+
+    /**
+     * 基于关键词判断用户查询是否涉及购票/退票相关。
+     */
+    private boolean isTicketRefundQuery(String queryText) {
+        if (queryText == null || queryText.isBlank()) {
+            return false;
+        }
+        for (String keyword : TicketRefundConstants.KEYWORDS) {
+            if (queryText.contains(keyword)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // ==================== 合并去重 ====================
+
+    /**
+     * 合并主 KB 和退购票 KB 的结果，按 (spotId + chunkTopic) 防御性去重。
+     */
+    private List<Document> mergeDocuments(List<Document> mainDocs, List<Document> ticketRefundDocs) {
+        if (ticketRefundDocs.isEmpty()) {
+            return mainDocs;
+        }
+
+        // 收集已有文档的 (spotId, chunkTopic) 指纹
+        Set<String> seen = new HashSet<>();
+        List<Document> merged = new ArrayList<>(mainDocs);
+        for (Document doc : mainDocs) {
+            seen.add(fingerprint(doc));
+        }
+
+        // 追加未重复的退购票文档
+        for (Document doc : ticketRefundDocs) {
+            if (seen.add(fingerprint(doc))) {
+                merged.add(doc);
+            }
+        }
+
+        return merged;
+    }
+
+    private String fingerprint(Document doc) {
+        String spotId = (String) doc.getMetadata().get("spotId");
+        String chunkTopic = (String) doc.getMetadata().get("chunkTopic");
+        String category = (String) doc.getMetadata().get("category");
+        return (spotId != null ? spotId : "") + "|"
+                + (chunkTopic != null ? chunkTopic : "")
+                + "|" + (category != null ? category : "");
     }
 
     // ==================== 供 Service 层调用的 API ====================
@@ -177,6 +335,22 @@ public class HybridDocumentRetriever implements DocumentRetriever {
     public List<Spot> getLastRetrievedSpots() {
         RetrievalContext ctx = contextHolder.get();
         return ctx != null ? ctx.getRetrievedSpots() : Collections.emptyList();
+    }
+
+    public String getLastRetrievalConfidence() {
+        RetrievalContext ctx = contextHolder.get();
+        return ctx != null ? ctx.getRetrievalConfidence() : "CONFIDENT";
+    }
+
+    public double getLastMaxRetrievalScore() {
+        RetrievalContext ctx = contextHolder.get();
+        return ctx != null ? ctx.getMaxRetrievalScore() : 0.0;
+    }
+
+    /** 获取 spotId → 距离 映射，供 Service 层构建 DTO 使用 */
+    public Map<Long, Double> getLastSpotDistances() {
+        RetrievalContext ctx = contextHolder.get();
+        return ctx != null ? ctx.getSpotDistances() : Collections.emptyMap();
     }
 
     public void clearContext() {
@@ -303,7 +477,9 @@ public class HybridDocumentRetriever implements DocumentRetriever {
     }
 
     private Document buildDocument(String text, Spot spot) {
-        return new Document(text, buildMetadata(spot));
+        // 在父文档文本前注入景点ID，确保 LLM 能获取 spotId 用于 Function Calling
+        String enrichedText = "景点ID：" + spot.getId() + "\n" + text;
+        return new Document(enrichedText, buildMetadata(spot));
     }
 
     private Document spotToDocument(Spot spot) {
@@ -324,20 +500,23 @@ public class HybridDocumentRetriever implements DocumentRetriever {
         if (spot.getOpenHours() != null) metadata.put("openHours", spot.getOpenHours());
         if (spot.getX() != null) metadata.put("x", spot.getX());
         if (spot.getY() != null) metadata.put("y", spot.getY());
-        if (spot.getDistance() != null) metadata.put("distance", spot.getDistance());
+        Double distance = getSpotDistance(spot.getId());
+        if (distance != null) metadata.put("distance", distance);
         return metadata;
     }
 
     private String buildSpotContent(Spot spot, String typeName) {
         StringBuilder sb = new StringBuilder();
+        sb.append("景点ID：").append(spot.getId()).append("\n");
         sb.append("景点名称：").append(spot.getName()).append("\n");
         sb.append("景点类型：").append(typeName).append("\n");
         if (spot.getArea() != null) sb.append("所在区域：").append(spot.getArea()).append("\n");
         if (spot.getAddress() != null) sb.append("具体地址：").append(spot.getAddress()).append("\n");
         sb.append("评分：").append(spot.getScore()).append("分\n");
         if (spot.getOpenHours() != null) sb.append("开放时间：").append(spot.getOpenHours()).append("\n");
-        if (spot.getDistance() != null)
-            sb.append(String.format("距离：%.2f 公里\n", spot.getDistance()));
+        Double distance = getSpotDistance(spot.getId());
+        if (distance != null)
+            sb.append(String.format("距离：%.2f 公里\n", distance));
         return sb.toString();
     }
 
@@ -349,16 +528,32 @@ public class HybridDocumentRetriever implements DocumentRetriever {
     }
 
     private List<Spot> sortByDistance(List<Spot> spots, Double userX, Double userY) {
+        // 计算距离到独立 map，不污染 Spot 实体（避免 MyBatis 缓存副作用）
+        Map<Long, Double> distanceMap = new HashMap<>();
+        for (Spot spot : spots) {
+            if (spot.getX() != null && spot.getY() != null) {
+                double dx = userX - spot.getX();
+                double dy = userY - spot.getY();
+                distanceMap.put(spot.getId(), Math.sqrt(dx * dx + dy * dy));
+            }
+        }
+        // 存入 ThreadLocal 上下文，供 Service 层构建 DTO 和 Document metadata 使用
+        RetrievalContext ctx = contextHolder.get();
+        if (ctx != null) {
+            ctx.setSpotDistances(distanceMap);
+        }
+
         return spots.stream()
-                .peek(spot -> {
-                    if (spot.getX() != null && spot.getY() != null) {
-                        double dx = userX - spot.getX();
-                        double dy = userY - spot.getY();
-                        spot.setDistance(Math.sqrt(dx * dx + dy * dy));
-                    }
-                })
-                .sorted(Comparator.comparing(Spot::getDistance,
+                .sorted(Comparator.comparing(
+                        (Spot s) -> distanceMap.get(s.getId()),
                         Comparator.nullsLast(Comparator.naturalOrder())))
                 .collect(Collectors.toList());
+    }
+
+    /** 从上下文获取 spotId 对应的距离，无坐标时返回 null */
+    private Double getSpotDistance(Long spotId) {
+        RetrievalContext ctx = contextHolder.get();
+        if (ctx == null) return null;
+        return ctx.getSpotDistances().get(spotId);
     }
 }

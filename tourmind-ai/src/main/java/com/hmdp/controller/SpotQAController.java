@@ -40,6 +40,25 @@ public class SpotQAController {
     }
 
     /**
+     * Agent 模式问答（LLM 自主决策检索/工具调用）
+     * POST /ai/spot/question/agent
+     */
+    @PostMapping("/question/agent")
+    public Result askSpotQuestionAgent(@RequestBody SpotQuestionRequest request) {
+        if (request.getUserId() == null) {
+            return Result.fail("用户 ID 不能为空");
+        }
+        return spotQAService.answerSpotQuestionAgent(
+                request.getUserId(),
+                request.getSessionId(),
+                request.getQuestion(),
+                request.getUserX(),
+                request.getUserY(),
+                request.getLimit() != null ? request.getLimit() : 5
+        );
+    }
+
+    /**
      * 针对特定商铺提问（支持多轮对话）
      * POST /ai/spot/{spotId}/question
      */
