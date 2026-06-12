@@ -2,6 +2,7 @@ package com.hmdp.agent;
 
 import com.hmdp.rag.query.RewriteQueryTransformer;
 import com.hmdp.rag.retrieval.HybridDocumentRetriever;
+import com.hmdp.tool.SearchKnowledgeBaseTool;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;

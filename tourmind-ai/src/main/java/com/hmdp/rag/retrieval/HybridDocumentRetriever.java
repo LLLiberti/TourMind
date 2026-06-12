@@ -60,9 +60,6 @@ public class HybridDocumentRetriever implements DocumentRetriever {
     /** typeId → typeName 本地缓存 */
     private final ConcurrentHashMap<Long, String> typeNameCache = new ConcurrentHashMap<>();
 
-    /** Per-request ThreadLocal 上下文 */
-    private final ThreadLocal<RetrievalContext> contextHolder = new ThreadLocal<>();
-
     public HybridDocumentRetriever(VectorStore vectorStore,
                                     SpotMapper spotMapper,
                                     SpotTypeMapper spotTypeMapper,
@@ -123,11 +120,7 @@ public class HybridDocumentRetriever implements DocumentRetriever {
 
         // ==================== CRAG 检索评估 ====================
         RetrievalEvaluator.EvaluationResult evalResult = retrievalEvaluator.evaluate(merged);
-        RetrievalContext ctx = contextHolder.get();
-        if (ctx == null) {
-            ctx = new RetrievalContext();
-            contextHolder.set(ctx);
-        }
+        RetrievalContext ctx = RetrievalContext.current();
         ctx.setRetrievalConfidence(evalResult.getConfidence().name());
         ctx.setMaxRetrievalScore(evalResult.getMaxScore());
         log.debug("CRAG 评估: confidence={}, maxScore={}", evalResult.getConfidence(), evalResult.getMaxScore());
@@ -203,11 +196,7 @@ public class HybridDocumentRetriever implements DocumentRetriever {
                 .collect(Collectors.toList());
 
         // ⑧ 距离排序
-        RetrievalContext ctx = contextHolder.get();
-        if (ctx == null) {
-            ctx = new RetrievalContext();
-            contextHolder.set(ctx);
-        }
+        RetrievalContext ctx = RetrievalContext.current();
         if (ctx.getUserX() != null && ctx.getUserY() != null) {
             orderedSpots = sortByDistance(orderedSpots, ctx.getUserX(), ctx.getUserY());
         }
@@ -326,35 +315,35 @@ public class HybridDocumentRetriever implements DocumentRetriever {
     // ==================== 供 Service 层调用的 API ====================
 
     public void setUserCoordinates(Double userX, Double userY) {
-        RetrievalContext ctx = new RetrievalContext();
+        RetrievalContext ctx = RetrievalContext.current();
         ctx.setUserX(userX);
         ctx.setUserY(userY);
-        contextHolder.set(ctx);
     }
 
     public List<Spot> getLastRetrievedSpots() {
-        RetrievalContext ctx = contextHolder.get();
-        return ctx != null ? ctx.getRetrievedSpots() : Collections.emptyList();
+        return RetrievalContext.current().getRetrievedSpots();
     }
 
     public String getLastRetrievalConfidence() {
-        RetrievalContext ctx = contextHolder.get();
-        return ctx != null ? ctx.getRetrievalConfidence() : "CONFIDENT";
+        return RetrievalContext.current().getRetrievalConfidence();
     }
 
     public double getLastMaxRetrievalScore() {
-        RetrievalContext ctx = contextHolder.get();
-        return ctx != null ? ctx.getMaxRetrievalScore() : 0.0;
+        return RetrievalContext.current().getMaxRetrievalScore();
     }
 
     /** 获取 spotId → 距离 映射，供 Service 层构建 DTO 使用 */
     public Map<Long, Double> getLastSpotDistances() {
-        RetrievalContext ctx = contextHolder.get();
-        return ctx != null ? ctx.getSpotDistances() : Collections.emptyMap();
+        return RetrievalContext.current().getSpotDistances();
+    }
+
+    /** 获取最近一次查询的复杂度（供 Service 层构建响应） */
+    public int getLastQueryComplexity() {
+        return RetrievalContext.current().getQueryComplexity();
     }
 
     public void clearContext() {
-        contextHolder.remove();
+        RetrievalContext.clear();
     }
 
     // ==================== 内部检索方法 ====================
@@ -538,10 +527,8 @@ public class HybridDocumentRetriever implements DocumentRetriever {
             }
         }
         // 存入 ThreadLocal 上下文，供 Service 层构建 DTO 和 Document metadata 使用
-        RetrievalContext ctx = contextHolder.get();
-        if (ctx != null) {
-            ctx.setSpotDistances(distanceMap);
-        }
+        RetrievalContext ctx = RetrievalContext.current();
+        ctx.setSpotDistances(distanceMap);
 
         return spots.stream()
                 .sorted(Comparator.comparing(
@@ -552,8 +539,6 @@ public class HybridDocumentRetriever implements DocumentRetriever {
 
     /** 从上下文获取 spotId 对应的距离，无坐标时返回 null */
     private Double getSpotDistance(Long spotId) {
-        RetrievalContext ctx = contextHolder.get();
-        if (ctx == null) return null;
-        return ctx.getSpotDistances().get(spotId);
+        return RetrievalContext.current().getSpotDistances().get(spotId);
     }
 }

@@ -9,6 +9,7 @@ import com.hmdp.rag.evaluation.RetrievalEvaluator;
 import com.hmdp.rag.index.EsChunkIndexer;
 import com.hmdp.rag.index.ParentChildIndexer;
 import com.hmdp.rag.index.TicketRefundIndexer;
+import com.hmdp.rag.query.CompressionQueryTransformer;
 import com.hmdp.rag.query.RewriteQueryTransformer;
 import com.hmdp.rag.router.QueryRouter;
 import com.hmdp.rag.retrieval.EsBm25Retriever;
@@ -186,7 +187,16 @@ public class AIConfig {
         return new QwenRerankClient(ragConfig.getReranker());
     }
 
-    // ==================== Query 重写（Agent 路径复用） ====================
+    // ==================== Query 变换（Agent 路径复用） ====================
+
+    /**
+     * 多轮指代消解 — 在 Query 改写前解析代词/序数指代。
+     */
+    @Bean
+    public CompressionQueryTransformer compressionQueryTransformer(
+            @Qualifier("deepSeekChatModel") ChatModel chatModel) {
+        return new CompressionQueryTransformer(chatModel);
+    }
 
     /**
      * Query 改写为关键词 — 供 Agent 路径的 SearchKnowledgeBaseTool 使用。

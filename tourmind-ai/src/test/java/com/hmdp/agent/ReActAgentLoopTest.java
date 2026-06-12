@@ -4,6 +4,7 @@ import com.hmdp.config.RagConfig;
 import com.hmdp.rag.retrieval.HybridDocumentRetriever;
 import com.hmdp.service.ISpotToolService;
 import com.hmdp.service.IWeatherService;
+import com.hmdp.tool.SearchKnowledgeBaseTool;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;

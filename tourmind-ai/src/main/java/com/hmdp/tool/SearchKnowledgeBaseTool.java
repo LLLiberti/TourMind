@@ -1,6 +1,6 @@
-package com.hmdp.agent;
+package com.hmdp.tool;
 
-import com.hmdp.rag.evaluation.RetrievalEvaluator;
+import com.hmdp.rag.query.CompressionQueryTransformer;
 import com.hmdp.rag.query.RewriteQueryTransformer;
 import com.hmdp.rag.retrieval.HybridDocumentRetriever;
 import lombok.extern.slf4j.Slf4j;
@@ -9,7 +9,10 @@ import org.springframework.ai.rag.Query;
 import org.springframework.stereotype.Component;
 
 import jakarta.annotation.Resource;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * 知识库检索工具 — 封装 RAG 管线为 Agent 可调用的工具。
@@ -29,6 +32,9 @@ public class SearchKnowledgeBaseTool {
     private HybridDocumentRetriever retriever;
 
     @Resource
+    private CompressionQueryTransformer compressor;
+
+    @Resource
     private RewriteQueryTransformer rewriter;
 
     /** 最多展示的文档数 */
@@ -36,6 +42,8 @@ public class SearchKnowledgeBaseTool {
 
     /**
      * 执行知识库检索。
+     *
+     * <p>管线：指代消解 → 查询改写 → 混合检索</p>
      *
      * @param queryJson 检索查询（JSON 字符串，格式: {@code {"query": "关键词"}}）
      * @return 格式化检索结果，含置信度和文档列表
@@ -48,12 +56,25 @@ public class SearchKnowledgeBaseTool {
 
         log.info("SearchKB: query='{}'", query);
 
-        // 1. Query 改写为关键词
-        Query rewritten = rewriter.transform(Query.builder().text(query).build());
+        Query q = Query.builder().text(query).build();
+
+        // 0. 多轮指代消解（在改写之前，解析"第二个""它"等指代）
+        if (compressor != null) {
+            q = compressor.transform(q);
+            log.debug("SearchKB: compressed='{}'", q.text());
+        }
+
+        // 1. Query 改写（关键词提取 / Multi-Query / HyDE 由策略决定）
+        Query rewritten = rewriter.transform(q);
         log.debug("SearchKB: rewritten='{}'", rewritten.text());
 
-        // 2. 混合检索（结果写入 ThreadLocal）
+        // 2. 混合检索
         List<Document> docs = retriever.retrieve(rewritten);
+        // multi-query 扩展结果合并（如果改写器生成了多个查询视角）
+        List<Query> expandedQueries = rewriter.getLastExpandedQueries();
+        if (expandedQueries != null && !expandedQueries.isEmpty()) {
+            docs = mergeMultiQueryResults(docs, expandedQueries);
+        }
 
         // 3. 读取置信度
         String confidence = retriever.getLastRetrievalConfidence();
@@ -61,6 +82,29 @@ public class SearchKnowledgeBaseTool {
 
         // 4. 格式化输出
         return formatResults(docs, confidence, maxScore);
+    }
+
+    /**
+     * 合并多查询视角的检索结果（去重 + 保留原始排序）。
+     */
+    private List<Document> mergeMultiQueryResults(List<Document> primaryDocs,
+                                                   List<Query> expandedQueries) {
+        List<Document> allDocs = new ArrayList<>(primaryDocs);
+        Set<String> seen = new LinkedHashSet<>();
+        for (Document doc : primaryDocs) {
+            String spotId = (String) doc.getMetadata().get("spotId");
+            if (spotId != null) seen.add(spotId);
+        }
+        for (Query eq : expandedQueries) {
+            List<Document> extra = retriever.retrieve(eq);
+            for (Document doc : extra) {
+                String spotId = (String) doc.getMetadata().get("spotId");
+                if (spotId == null || seen.add(spotId)) {
+                    allDocs.add(doc);
+                }
+            }
+        }
+        return allDocs;
     }
 
     /**

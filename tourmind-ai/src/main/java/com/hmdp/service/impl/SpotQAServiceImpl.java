@@ -99,7 +99,11 @@ public class SpotQAServiceImpl implements ISpotQAService {
         log.info("Agent 分流: query='{}' → category={}", question, category);
 
         if (category == QueryRouter.Category.CHITCHAT) {
-            return answerChitchat(question, conversationId, limit);
+            try {
+                return answerChitchat(question, conversationId, limit);
+            } finally {
+                spotDocumentRetriever.clearContext();
+            }
         }
 
         try {
@@ -138,6 +142,7 @@ public class SpotQAServiceImpl implements ISpotQAService {
             resultMap.put("sessionId", conversationId);
             resultMap.put("recommendedSpots", spotDTOs);
             resultMap.put("category", category.name());
+            resultMap.put("queryComplexity", spotDocumentRetriever.getLastQueryComplexity());
             resultMap.put("retrievalConfidence", confidence != null ? confidence : "UNKNOWN");
             resultMap.put("agentTrace", agentResult.trace());
             return Result.ok(resultMap);
