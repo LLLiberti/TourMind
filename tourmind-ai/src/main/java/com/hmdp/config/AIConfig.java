@@ -4,22 +4,28 @@ import co.elastic.clients.elasticsearch.ElasticsearchClient;
 import com.hmdp.mapper.SpotKnowledgeMapper;
 import com.hmdp.mapper.SpotMapper;
 import com.hmdp.mapper.SpotTypeMapper;
+import com.hmdp.rag.cache.RetrievalCacheManager;
 import com.hmdp.rag.client.QwenRerankClient;
+import com.hmdp.rag.evaluation.CragCorrector;
 import com.hmdp.rag.evaluation.RetrievalEvaluator;
+import com.hmdp.rag.generation.GenerationGuard;
 import com.hmdp.rag.index.EsChunkIndexer;
 import com.hmdp.rag.index.ParentChildIndexer;
 import com.hmdp.rag.index.TicketRefundIndexer;
 import com.hmdp.rag.query.CompressionQueryTransformer;
 import com.hmdp.rag.query.RewriteQueryTransformer;
-import com.hmdp.rag.router.QueryRouter;
 import com.hmdp.rag.retrieval.EsBm25Retriever;
 import com.hmdp.rag.retrieval.HybridDocumentRetriever;
+import com.hmdp.rag.retrieval.MmrDiversifier;
 import com.hmdp.rag.retrieval.RrfRankFuser;
+import com.hmdp.rag.router.QueryRouter;
+import com.hmdp.service.impl.ConversationSummaryService;
 import com.hmdp.tool.SpotTools;
 import com.hmdp.tool.WeatherTools;
 import io.qdrant.client.QdrantClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor;
 import org.springframework.ai.chat.client.advisor.SimpleLoggerAdvisor;
@@ -74,10 +80,12 @@ public class AIConfig {
                                                           VectorStore ticketRefundVectorStore,
                                                           @Qualifier("ticketRefundEsBm25Retriever")
                                                           EsBm25Retriever ticketRefundEsBm25Retriever,
-                                                          RetrievalEvaluator retrievalEvaluator) {
+                                                          RetrievalEvaluator retrievalEvaluator,
+                                                          MmrDiversifier mmrDiversifier) {
         return new HybridDocumentRetriever(vectorStore, spotMapper, spotTypeMapper, ragConfig,
                 esBm25Retriever, rrfRankFuser, parentChildIndexer, rerankClient,
-                ticketRefundVectorStore, ticketRefundEsBm25Retriever, retrievalEvaluator);
+                ticketRefundVectorStore, ticketRefundEsBm25Retriever, retrievalEvaluator,
+                mmrDiversifier);
     }
 
     /**
@@ -205,6 +213,50 @@ public class AIConfig {
     public RewriteQueryTransformer rewriteQueryTransformer(
             @Qualifier("deepSeekChatModel") ChatModel chatModel, RagConfig ragConfig) {
         return new RewriteQueryTransformer(chatModel, ragConfig.getRewrite().getMinQueryLength());
+    }
+
+    // ==================== P1 新增 Beans ====================
+
+    /** MMR 多样性重排器 */
+    @Bean
+    public MmrDiversifier mmrDiversifier(RagConfig ragConfig) {
+        return new MmrDiversifier(ragConfig.getMmr().getLambda());
+    }
+
+    /** CRAG 纠正器 */
+    @Bean
+    public CragCorrector cragCorrector(SpotMapper spotMapper,
+                                        ParentChildIndexer parentChildIndexer,
+                                        RagConfig ragConfig) {
+        CragCorrector.WebSearchClient webClient = null;
+        if (ragConfig.getCragCorrection().isWebFallbackEnabled()
+                && !ragConfig.getCragCorrection().getWebSearchApiKey().isEmpty()) {
+            webClient = new CragCorrector.BaiduSearchClient(
+                    ragConfig.getCragCorrection().getWebSearchApiKey(),
+                    ragConfig.getCragCorrection().getWebSearchEndpoint());
+        }
+        return new CragCorrector(spotMapper, parentChildIndexer, ragConfig, webClient);
+    }
+
+    /** 生成质量守护 */
+    @Bean
+    public GenerationGuard generationGuard(
+            @Qualifier("deepSeekChatModel") ChatModel chatModel) {
+        return new GenerationGuard(chatModel);
+    }
+
+    /** 检索结果缓存管理器（依赖 RedisTemplate） */
+    @Bean
+    public RetrievalCacheManager retrievalCacheManager(
+            RedisTemplate<String, String> redisTemplate, RagConfig ragConfig) {
+        return new RetrievalCacheManager(redisTemplate, ragConfig.getCache().isEnabled());
+    }
+
+    /** 对话摘要服务 */
+    @Bean
+    public ConversationSummaryService conversationSummaryService(
+            @Qualifier("deepSeekChatModel") ChatModel chatModel) {
+        return new ConversationSummaryService(chatModel);
     }
 
     // ==================== 聊天记忆 ====================

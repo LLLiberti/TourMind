@@ -2,9 +2,12 @@ package com.hmdp.agent;
 
 import com.hmdp.config.RagConfig;
 import com.hmdp.rag.RetrievalContext;
+import com.hmdp.rag.generation.GenerationGuard;
 import com.hmdp.rag.retrieval.HybridDocumentRetriever;
 import com.hmdp.service.ISpotToolService;
 import com.hmdp.service.IWeatherService;
+import com.hmdp.service.impl.ConversationSummaryService;
+import com.hmdp.service.impl.PersistentChatMemory;
 import com.hmdp.tool.SearchKnowledgeBaseTool;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
@@ -76,6 +79,15 @@ public class ReActAgentLoop {
 
     @Resource
     private HybridDocumentRetriever retriever;
+
+    @Resource
+    private com.hmdp.rag.generation.GenerationGuard generationGuard;
+
+    @Resource
+    private com.hmdp.service.impl.PersistentChatMemory persistentChatMemory;
+
+    @Resource
+    private com.hmdp.service.impl.ConversationSummaryService summaryService;
 
     @Resource
     private RagConfig ragConfig;
@@ -420,9 +432,77 @@ public class ReActAgentLoop {
             trace.setHitMaxIterations(true);
         }
 
+        // 【P1 生成质量守护】Citation + 冲突检测 + 事实性校验
+        finalAnswer = applyGenerationGuard(finalAnswer);
+
+        // 【P1 摘要压缩】检查是否触发摘要
+        triggerSummaryIfNeeded(conversationId, messages, persistedIdx);
+
         persistToMemory(conversationId, messages, persistedIdx);
         trace.setTotalIterations(trace.getSteps().size());
         return new AgentResult(finalAnswer, trace);
+    }
+
+    /**
+     * 对最终回答应用生成质量守护（Citation + 冲突检测）。
+     */
+    private String applyGenerationGuard(String answer) {
+        if (generationGuard == null || answer == null) return answer;
+
+        try {
+            // 冲突检测：比较知识库与实时工具数据
+            // （简化实现：通过 retriever 上下文判断是否有冲突标记）
+            RagConfig.GuardConfig guardConfig = ragConfig.getGuard();
+            if (guardConfig.isConflictDetectionEnabled()) {
+                // 检查回答中是否有需要标注差异的信息
+                String confidence = retriever.getLastRetrievalConfidence();
+                if ("AMBIGUOUS".equals(confidence)) {
+                    answer = answer + "\n\n⚠️ 部分信息可能不完全匹配，建议以实时查询结果为准。";
+                }
+            }
+
+            // Citation 统计
+            if (guardConfig.isCitationEnabled()) {
+                List<Integer> refs = GenerationGuard.extractCitations(answer);
+                if (refs.isEmpty() && answer.length() > 50) {
+                    answer = answer + "\n\n[未检测到引用标记]";
+                }
+            }
+
+            // 事实性校验（有 LLM 开销，默认关闭）
+            if (guardConfig.isFactCheckEnabled()) {
+                GenerationGuard.FactCheckResult fcr = generationGuard.checkFactuality(
+                        answer, Collections.emptyList()); // docs 从 SearchKB 获取较复杂，生产环境需改进
+                if (!fcr.isPassed()) {
+                    answer = answer + GenerationGuard.buildUnsourceWarning(fcr);
+                }
+            }
+        } catch (Exception e) {
+            log.warn("生成质量守护执行异常: {}", e.getMessage());
+        }
+
+        return answer;
+    }
+
+    /**
+     * 检查并触发对话摘要压缩。
+     */
+    private void triggerSummaryIfNeeded(String conversationId,
+                                         List<Message> messages, int persistedIdx) {
+        if (conversationId == null || persistentChatMemory == null || summaryService == null) return;
+        try {
+            if (persistentChatMemory.shouldSummarize(conversationId)) {
+                List<Message> allMsgs = persistentChatMemory.get(conversationId);
+                String existingSummary = persistentChatMemory.getSummary(conversationId);
+                String newSummary = summaryService.summarize(allMsgs, existingSummary);
+                if (!newSummary.isBlank()) {
+                    persistentChatMemory.updateSummary(conversationId, newSummary);
+                    log.info("摘要已更新: conversationId={}, len={}", conversationId, newSummary.length());
+                }
+            }
+        } catch (Exception e) {
+            log.debug("摘要压缩跳过: {}", e.getMessage());
+        }
     }
 
     // ==================== 并行工具调用 ====================
@@ -669,7 +749,27 @@ public class ReActAgentLoop {
     private String buildSystemPrompt(RagConfig.AgentConfig ac) {
         return ac.getSystemPrompt() + "\n\n" +
                "【约束】单次对话工具调用总数不超过 " + ac.getMaxIterations() + " 次。" +
-               "同一工具+同一参数最多调用 2 次。多个无依赖的工具可以同时调用。";
+               "同一工具+同一参数最多调用 2 次。多个无依赖的工具可以同时调用。" +
+               // 【P1 摘要注入】如果有对话摘要，追加到系统提示
+               buildSummaryInjection();
+    }
+
+    /** 从 PersistentChatMemory 获取摘要并注入到系统提示 */
+    private String buildSummaryInjection() {
+        if (persistentChatMemory == null || summaryService == null) return "";
+        String conversationId = null;
+        try {
+            // 从 RetrievalContext 或 ChatMemory 间接获取 conversationId
+            // conversationId 在 ReActAgentLoop 中作为参数传递，此处从线程上下文获取
+            conversationId = RetrievalContext.current().getLastDiscussedEntity();
+        } catch (Exception ignored) {}
+        if (conversationId == null) return "";
+
+        String summary = persistentChatMemory.getSummary(conversationId);
+        if (summary != null && !summary.isBlank()) {
+            return "\n\n【对话历史摘要】" + summary;
+        }
+        return "";
     }
 
     // ==================== ChatMemory 持久化 ====================

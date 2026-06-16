@@ -15,6 +15,7 @@ import jakarta.annotation.Resource;
 import java.util.List;
 
 import static com.hmdp.constant.RedisConstant.SECKILL_STOCK_KEY;
+import static com.hmdp.constant.RedisConstant.SECKILL_VOUCHER_KEY;
 
 /**
  * <p>
@@ -52,8 +53,12 @@ public class VoucherServiceImpl extends ServiceImpl<VoucherMapper, Voucher> impl
         seckillVoucher.setStock(voucher.getStock());
         seckillVoucher.setBeginTime(voucher.getBeginTime());
         seckillVoucher.setEndTime(voucher.getEndTime());
+        // Redis 缓存秒杀券元信息（beginTime/endTime 不可变，stock 由 Lua 脚本维护）
+        String voucherKey = SECKILL_VOUCHER_KEY + voucher.getId();
+        redisTemplate.opsForHash().put(voucherKey, "beginTime", voucher.getBeginTime().toString());
+        redisTemplate.opsForHash().put(voucherKey, "endTime", voucher.getEndTime().toString());
+        // stock 写入 seckill:stock:{voucherId}，与 Lua 脚本共用同一个 key
         redisTemplate.opsForValue().set(SECKILL_STOCK_KEY + voucher.getId(), voucher.getStock().toString());
-
 
         seckillVoucherService.save(seckillVoucher);
     }

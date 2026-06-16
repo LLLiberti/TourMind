@@ -27,7 +27,11 @@ import org.springframework.transaction.annotation.Transactional;
 
 import jakarta.annotation.Resource;
 import java.time.LocalDateTime;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
+
+import static com.hmdp.constant.RedisConstant.SECKILL_STOCK_KEY;
+import static com.hmdp.constant.RedisConstant.SECKILL_VOUCHER_KEY;
 
 /**
  * <p>
@@ -58,20 +62,41 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
 
     @Override
     public Result seckillVoucher(Long voucherId) {
-        //查询优惠券
-        SeckillVoucher voucher = seckillVoucherService.getById(voucherId);
-        if (voucher.getBeginTime().isAfter(LocalDateTime.now())) {
-            //尚未开始
-            return Result.fail("秒杀尚未开始");
+        // 从 Redis 缓存查询秒杀券信息，避免压测时 DB 成为瓶颈
+        String voucherKey = SECKILL_VOUCHER_KEY + voucherId;
+        Map<Object, Object> cache = redisTemplate.opsForHash().entries(voucherKey);
+        if (cache.isEmpty()) {
+            // 缓存未命中，降级查 DB（兜底）
+            SeckillVoucher voucher = seckillVoucherService.getById(voucherId);
+            if (voucher == null) {
+                return Result.fail("秒杀券不存在");
+            }
+            if (voucher.getBeginTime().isAfter(LocalDateTime.now())) {
+                return Result.fail("秒杀尚未开始");
+            }
+            if (voucher.getEndTime().isBefore(LocalDateTime.now())) {
+                return Result.fail("秒杀已经结束");
+            }
+            if (voucher.getStock() < 1) {
+                return Result.fail("库存不足");
+            }
+        } else {
+            LocalDateTime beginTime = LocalDateTime.parse(cache.get("beginTime").toString());
+            LocalDateTime endTime = LocalDateTime.parse(cache.get("endTime").toString());
+            LocalDateTime now = LocalDateTime.now();
+            if (beginTime.isAfter(now)) {
+                return Result.fail("秒杀尚未开始");
+            }
+            if (endTime.isBefore(now)) {
+                return Result.fail("秒杀已经结束");
+            }
+            // stock 从 seckill:stock:{voucherId} 读取，与 Lua 脚本共用同一个 key
+            Object stockObj = redisTemplate.opsForValue().get(SECKILL_STOCK_KEY + voucherId);
+            if (stockObj == null || Integer.parseInt(stockObj.toString()) <= 0) {
+                return Result.fail("库存不足");
+            }
         }
-        if (voucher.getEndTime().isBefore(LocalDateTime.now())) {
-            //已经结束
-            return Result.fail("秒杀已经结束");
-        }
-        if (voucher.getStock() < 1) {
-            //库存不足
-            return Result.fail("库存不足");
-        }
+
         Long userId = UserContext.getUser().getId();
         RLock lock = redissonClient.getLock("lock:order:" + userId);
         try {

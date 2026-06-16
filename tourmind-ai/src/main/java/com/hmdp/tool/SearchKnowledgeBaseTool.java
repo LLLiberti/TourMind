@@ -1,5 +1,8 @@
 package com.hmdp.tool;
 
+import com.hmdp.rag.cache.RetrievalCacheManager;
+import com.hmdp.rag.evaluation.CragCorrector;
+import com.hmdp.rag.generation.GenerationGuard;
 import com.hmdp.rag.query.CompressionQueryTransformer;
 import com.hmdp.rag.query.RewriteQueryTransformer;
 import com.hmdp.rag.retrieval.HybridDocumentRetriever;
@@ -10,6 +13,7 @@ import org.springframework.stereotype.Component;
 
 import jakarta.annotation.Resource;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
@@ -37,16 +41,22 @@ public class SearchKnowledgeBaseTool {
     @Resource
     private RewriteQueryTransformer rewriter;
 
+    @Resource
+    private RetrievalCacheManager cacheManager;
+
+    @Resource
+    private CragCorrector cragCorrector;
+
+    @Resource
+    private GenerationGuard generationGuard;
+
     /** 最多展示的文档数 */
     private static final int MAX_DOCS_TO_SHOW = 5;
 
     /**
-     * 执行知识库检索。
+     * 执行知识库检索（P1 增强版：缓存 + CRAG + Citation）。
      *
-     * <p>管线：指代消解 → 查询改写 → 混合检索</p>
-     *
-     * @param queryJson 检索查询（JSON 字符串，格式: {@code {"query": "关键词"}}）
-     * @return 格式化检索结果，含置信度和文档列表
+     * <p>管线：缓存查询 → 指代消解 → 查询改写 → 混合检索 → CRAG纠正 → Citation注入</p>
      */
     public String execute(String queryJson) {
         String query = extractQuery(queryJson);
@@ -56,32 +66,71 @@ public class SearchKnowledgeBaseTool {
 
         log.info("SearchKB: query='{}'", query);
 
+        // 0. 缓存查询
+        if (cacheManager != null) {
+            String cached = cacheManager.get(query);
+            if (cached != null) {
+                log.info("SearchKB: 缓存命中");
+                return cached;
+            }
+        }
+
         Query q = Query.builder().text(query).build();
 
-        // 0. 多轮指代消解（在改写之前，解析"第二个""它"等指代）
+        // 1. 多轮指代消解
         if (compressor != null) {
             q = compressor.transform(q);
             log.debug("SearchKB: compressed='{}'", q.text());
         }
 
-        // 1. Query 改写（关键词提取 / Multi-Query / HyDE 由策略决定）
+        // 2. Query 改写
         Query rewritten = rewriter.transform(q);
         log.debug("SearchKB: rewritten='{}'", rewritten.text());
 
-        // 2. 混合检索
+        // 3. 混合检索
         List<Document> docs = retriever.retrieve(rewritten);
-        // multi-query 扩展结果合并（如果改写器生成了多个查询视角）
         List<Query> expandedQueries = rewriter.getLastExpandedQueries();
         if (expandedQueries != null && !expandedQueries.isEmpty()) {
             docs = mergeMultiQueryResults(docs, expandedQueries);
         }
 
-        // 3. 读取置信度
+        // 4. 读取置信度
         String confidence = retriever.getLastRetrievalConfidence();
         double maxScore = retriever.getLastMaxRetrievalScore();
 
-        // 4. 格式化输出
-        return formatResults(docs, confidence, maxScore);
+        // 5. 【P1 CRAG 纠正】检索不足时自动纠正
+        if ("INSUFFICIENT".equals(confidence) && cragCorrector != null) {
+            CragCorrector.CorrectionResult cr = cragCorrector.correct(query, maxScore);
+            if (!cr.getCorrectedQuery().equals(query)) {
+                log.info("CRAG: 用修正查询重新检索 '{}'", cr.getCorrectedQuery());
+                Query correctedQ = Query.builder().text(cr.getCorrectedQuery()).build();
+                List<Document> reDocs = retriever.retrieve(correctedQ);
+                if (!reDocs.isEmpty()) {
+                    docs = reDocs;
+                    confidence = retriever.getLastRetrievalConfidence();
+                    maxScore = retriever.getLastMaxRetrievalScore();
+                }
+            }
+            // Web 回退结果追加
+            if (!cr.getWebSnippets().isEmpty()) {
+                for (String snippet : cr.getWebSnippets()) {
+                    docs.add(new Document("[Web补充] " + snippet,
+                            Collections.singletonMap("source", "web")));
+                }
+                confidence = "AMBIGUOUS"; // web 结果不可完全信任
+                log.info("CRAG: 追加 {} 条 web 摘要", cr.getWebSnippets().size());
+            }
+        }
+
+        // 6. 格式化输出（含 Citation 指令）
+        String result = formatResults(docs, confidence, maxScore);
+
+        // 7. 写入缓存
+        if (cacheManager != null) {
+            cacheManager.put(query, result);
+        }
+
+        return result;
     }
 
     /**
@@ -154,11 +203,14 @@ public class SearchKnowledgeBaseTool {
           .append(" | 最高分: ").append(String.format("%.2f", maxScore))
           .append("\n\n");
 
+        // Citation 注入指令
+        sb.append("[引用] 请在引用以下文档信息时标注编号，例如 [1]。\n\n");
+
         // 列出文档（最多 5 条）
         int showCount = Math.min(docs.size(), MAX_DOCS_TO_SHOW);
         for (int i = 0; i < showCount; i++) {
             Document doc = docs.get(i);
-            sb.append("--- 文档").append(i + 1).append(" ---\n");
+            sb.append("--- 文档 [").append(i + 1).append("] ---\n");
             String text = truncate(doc.getText(), 400);
             sb.append(text).append("\n");
         }

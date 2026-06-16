@@ -23,6 +23,7 @@ public class RedisConstant {
     public static final Long LOCK_SPOT_TTL = 10L;
 
     public static final String SECKILL_STOCK_KEY = "seckill:stock:";
+    public static final String SECKILL_VOUCHER_KEY = "seckill:voucher:";
     public static final String BLOG_LIKED_KEY = "blog:liked:";
     public static final String FEED_KEY = "feed:";
     public static final String SPOT_GEO_KEY = "spot:geo:";

@@ -10,6 +10,7 @@ import com.hmdp.rag.client.QwenRerankClient;
 import com.hmdp.rag.evaluation.RetrievalEvaluator;
 import com.hmdp.rag.router.TicketRefundConstants;
 import com.hmdp.rag.index.ParentChildIndexer;
+import com.hmdp.rag.retrieval.MmrDiversifier;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.document.Document;
@@ -57,6 +58,9 @@ public class HybridDocumentRetriever implements DocumentRetriever {
     /** CRAG 检索质量评估器 */
     private final RetrievalEvaluator retrievalEvaluator;
 
+    /** MMR 多样性重排器（可选，未启用时为 null） */
+    private final MmrDiversifier mmrDiversifier;
+
     /** typeId → typeName 本地缓存 */
     private final ConcurrentHashMap<Long, String> typeNameCache = new ConcurrentHashMap<>();
 
@@ -70,7 +74,8 @@ public class HybridDocumentRetriever implements DocumentRetriever {
                                     QwenRerankClient rerankClient,
                                     VectorStore ticketRefundVectorStore,
                                     EsBm25Retriever ticketRefundEsBm25Retriever,
-                                    RetrievalEvaluator retrievalEvaluator) {
+                                    RetrievalEvaluator retrievalEvaluator,
+                                    MmrDiversifier mmrDiversifier) {
         this.vectorStore = vectorStore;
         this.spotMapper = spotMapper;
         this.spotTypeMapper = spotTypeMapper;
@@ -82,6 +87,7 @@ public class HybridDocumentRetriever implements DocumentRetriever {
         this.ticketRefundVectorStore = ticketRefundVectorStore;
         this.ticketRefundEsBm25Retriever = ticketRefundEsBm25Retriever;
         this.retrievalEvaluator = retrievalEvaluator;
+        this.mmrDiversifier = mmrDiversifier;
     }
 
     @PostConstruct
@@ -157,20 +163,30 @@ public class HybridDocumentRetriever implements DocumentRetriever {
                                              int maxContextSpots) {
         RagConfig.RrfConfig rrfConfig = ragConfig.getRrf();
 
+        // 【P1 自适应检索】根据复杂度调整 topK
+        int adaptiveTopK = computeAdaptiveTopK(rrfConfig.getTopK());
+
         // ③ 转换为统一 ScoredDoc 格式
         List<RrfRankFuser.ScoredDoc> vecScored = fromVectorResults(vectorDocs);
 
         // ④ RRF 排名融合
         List<RrfRankFuser.FusedResult> fused = rrfRankFuser.fuse(
-                esResults, vecScored, rrfConfig.getTopK());
-        log.debug("主KB RRF 融合: {} 个候选", fused.size());
+                esResults, vecScored, adaptiveTopK);
+        log.debug("主KB RRF 融合: {} 个候选 (adaptive topK={})", fused.size(), adaptiveTopK);
 
-        // ⑤ 重排（可选）
-        if (rerankClient != null && ragConfig.getReranker().isEnabled()) {
+        // ⑤ 重排（可选，自适应启用）
+        if (rerankClient != null && shouldEnableRerank()) {
             fused = applyRerank(queryText, fused);
         }
 
-        // ⑥ 提取 spotId 列表
+        // ⑥ 【P1 MMR 多样性】在提取 spotId 前应用 MMR
+        if (mmrDiversifier != null && ragConfig.getMmr().isEnabled()) {
+            int mmrTopK = Math.min(fused.size(), maxContextSpots);
+            fused = mmrDiversifier.diversify(fused, mmrTopK);
+            log.debug("MMR 多样性重排: {} 个候选", fused.size());
+        }
+
+        // ⑦ 提取 spotId 列表
         List<Long> spotIds = fused.stream()
                 .map(fr -> {
                     try { return Long.valueOf(fr.getSpotId()); }
@@ -186,7 +202,7 @@ public class HybridDocumentRetriever implements DocumentRetriever {
             return Collections.emptyList();
         }
 
-        // ⑦ DB 批量查询（保持融合排序）
+        // ⑧ DB 批量查询（保持融合排序）
         List<Spot> spots = spotMapper.selectBatchIds(spotIds);
         Map<Long, Spot> spotMap = spots.stream()
                 .collect(Collectors.toMap(Spot::getId, Function.identity(), (a, b) -> a));
@@ -195,16 +211,16 @@ public class HybridDocumentRetriever implements DocumentRetriever {
                 .filter(Objects::nonNull)
                 .collect(Collectors.toList());
 
-        // ⑧ 距离排序
+        // ⑨ 距离排序
         RetrievalContext ctx = RetrievalContext.current();
         if (ctx.getUserX() != null && ctx.getUserY() != null) {
             orderedSpots = sortByDistance(orderedSpots, ctx.getUserX(), ctx.getUserY());
         }
 
-        // ⑨ ThreadLocal 缓存
+        // ⑩ ThreadLocal 缓存
         ctx.setRetrievedSpots(orderedSpots);
 
-        // ⑩ 加载父文档全文 → 构造返回 Document
+        // ⑪ 加载父文档全文 → 构造返回 Document
         return orderedSpots.stream()
                 .map(this::spotToParentDocument)
                 .collect(Collectors.toList());
@@ -356,7 +372,7 @@ public class HybridDocumentRetriever implements DocumentRetriever {
             SearchRequest request = SearchRequest.builder()
                     .query(queryText)
                     .topK(topK)
-                    .similarityThreshold(ragConfig.getSimilarityThreshold())
+                    .similarityThreshold(computeAdaptiveThreshold())
                     .filterExpression(new FilterExpressionBuilder()
                             .eq(ParentChildIndexer.META_DOC_TYPE, "child")
                             .build())
@@ -540,5 +556,32 @@ public class HybridDocumentRetriever implements DocumentRetriever {
     /** 从上下文获取 spotId 对应的距离，无坐标时返回 null */
     private Double getSpotDistance(Long spotId) {
         return RetrievalContext.current().getSpotDistances().get(spotId);
+    }
+
+    // ==================== P1 自适应参数 ====================
+
+    /** 根据 queryComplexity 计算自适应 topK */
+    private int computeAdaptiveTopK(int defaultTopK) {
+        RagConfig.AdaptiveRetrievalConfig arc = ragConfig.getAdaptiveRetrieval();
+        if (!arc.isEnabled()) return defaultTopK;
+        int complexity = RetrievalContext.current().getQueryComplexity();
+        if (complexity <= 2) return arc.getSimpleTopK();
+        if (complexity == 3) return arc.getMediumTopK();
+        return arc.getComplexTopK();
+    }
+
+    /** 根据 queryComplexity 计算自适应相似度阈值 */
+    private double computeAdaptiveThreshold() {
+        RagConfig.AdaptiveRetrievalConfig arc = ragConfig.getAdaptiveRetrieval();
+        if (!arc.isEnabled()) return ragConfig.getSimilarityThreshold();
+        int complexity = RetrievalContext.current().getQueryComplexity();
+        return complexity <= 2 ? arc.getSimpleThreshold() : arc.getComplexThreshold();
+    }
+
+    /** 根据 queryComplexity 决定是否启用重排 */
+    private boolean shouldEnableRerank() {
+        if (!ragConfig.getReranker().isEnabled()) return false;
+        if (!ragConfig.getAdaptiveRetrieval().isEnabled()) return true;
+        return RetrievalContext.current().getQueryComplexity() >= 3;
     }
 }

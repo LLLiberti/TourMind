@@ -89,6 +89,24 @@ public class RagConfig {
     /** ReACT Agent 配置 */
     private AgentConfig agent = new AgentConfig();
 
+    /** 自适应检索配置 */
+    private AdaptiveRetrievalConfig adaptiveRetrieval = new AdaptiveRetrievalConfig();
+
+    /** MMR 多样性配置 */
+    private MmrConfig mmr = new MmrConfig();
+
+    /** CRAG 纠正配置 */
+    private CragCorrectionConfig cragCorrection = new CragCorrectionConfig();
+
+    /** 检索缓存配置 */
+    private CacheConfig cache = new CacheConfig();
+
+    /** 聊天记忆持久化配置 */
+    private MemoryConfig memory = new MemoryConfig();
+
+    /** 生成质量守护配置 */
+    private GuardConfig guard = new GuardConfig();
+
     // ==================== 嵌套配置类 ====================
 
     @Data
@@ -217,5 +235,75 @@ public class RagConfig {
             private String indexName = "ticket_refund_chunks";
             private int topK = 10;
         }
+    }
+
+    // ==================== P1 新增配置 ====================
+
+    @Data
+    public static class AdaptiveRetrievalConfig {
+        /** 是否启用自适应检索参数 */
+        private boolean enabled = true;
+        /** 简单查询 topK（复杂度 1-2） */
+        private int simpleTopK = 5;
+        /** 中等查询 topK（复杂度 3） */
+        private int mediumTopK = 10;
+        /** 复杂查询 topK（复杂度 4-5） */
+        private int complexTopK = 20;
+        /** 简单查询相似度阈值 */
+        private double simpleThreshold = 0.5;
+        /** 复杂查询相似度阈值（放宽以召回更多） */
+        private double complexThreshold = 0.35;
+    }
+
+    @Data
+    public static class MmrConfig {
+        /** 是否启用 MMR 多样性重排 */
+        private boolean enabled = true;
+        /** 相关性权重（0=全多样性, 1=全相关性） */
+        private double lambda = 0.7;
+    }
+
+    @Data
+    public static class CragCorrectionConfig {
+        /** 是否启用 CRAG 自动纠正 */
+        private boolean enabled = true;
+        /** 是否启用 Web 搜索回退（需配置 API key） */
+        private boolean webFallbackEnabled = false;
+        /** Web 搜索 API key（百度/必应） */
+        private String webSearchApiKey = "";
+        /** Web 搜索端点 */
+        private String webSearchEndpoint = "";
+    }
+
+    @Data
+    public static class CacheConfig {
+        /** 是否启用检索缓存 */
+        private boolean enabled = true;
+        /** L1 精确缓存 TTL（分钟） */
+        private int l1TtlMinutes = 10;
+        /** L2 语义缓存 TTL（分钟） */
+        private int l2TtlMinutes = 30;
+    }
+
+    @Data
+    public static class MemoryConfig {
+        /** 是否启用 Redis+MySQL 持久化 */
+        private boolean persistentEnabled = false;
+        /** Redis TTL（小时） */
+        private int redisTtlHours = 24;
+        /** 每 N 轮触发摘要压缩 */
+        private int summaryInterval = 5;
+    }
+
+    @Data
+    public static class GuardConfig {
+        /** 是否启用生成质量守护 */
+        private boolean enabled = true;
+        /** 是否启用 Citation 注入 */
+        private boolean citationEnabled = true;
+        /** 是否启用事实性校验（有 LLM 调用开销） */
+        private boolean factCheckEnabled = false;
+        /** 是否启用冲突检测 */
+        private boolean conflictDetectionEnabled = true;
     }
 }
