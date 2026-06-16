@@ -1,11 +1,15 @@
 package com.hmdp.config;
 
+import com.hmdp.service.impl.PersistentChatMemory;
 import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.memory.ChatMemory;
 import org.springframework.ai.chat.messages.Message;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Primary;
+import org.springframework.data.redis.core.RedisTemplate;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -15,20 +19,39 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
 /**
- * 聊天记忆配置（纯内存存储，无服务端持久化）
+ * 聊天记忆配置 — 支持内存存储和 Redis 持久化存储两种模式。
  *
- * 设计原则：
- * - 聊天记忆仅存储在 JVM 堆内存中，服务重启后清空
- * - 消息数上限由 ConversationConfig.maxMessages 控制，滑动窗口自动淘汰
- * - 会话有效性校验（超时/消息数超限）由 ConversationService 负责，
- *   ChatMemory 只负责消息的存取
+ * <p>默认使用内存存储（InMemoryChatMemory），零配置、零依赖。
+ * 设置 rag.memory.persistent-enabled=true 启用 Redis 持久化（PersistentChatMemory）。</p>
  */
 @Slf4j
 @Configuration
 public class ChatMemoryConfig {
 
+    /**
+     * 持久化聊天记忆 Bean — 需要 Redis 依赖。
+     * <p>仅当 rag.memory.persistent-enabled=true 时激活。</p>
+     */
     @Bean
+    @ConditionalOnProperty(prefix = "rag.memory", name = "persistent-enabled", havingValue = "true")
+    @Primary
+    public ChatMemory persistentChatMemory(RedisTemplate<String, String> redisTemplate,
+                                            ConversationConfig convConfig,
+                                            RagConfig ragConfig) {
+        log.info("启用 PersistentChatMemory (Redis 持久化)");
+        return new PersistentChatMemory(redisTemplate,
+                convConfig.getMaxMessages(),
+                convConfig.getMaxConversationsPerUser());
+    }
+
+    /**
+     * 内存聊天记忆 Bean — 默认实现，无需外部依赖。
+     */
+    @Bean
+    @ConditionalOnProperty(prefix = "rag.memory", name = "persistent-enabled", havingValue = "false",
+            matchIfMissing = true)
     public ChatMemory chatMemory(ConversationConfig config) {
+        log.info("启用 InMemoryChatMemory (内存存储)");
         return new InMemoryChatMemory(config);
     }
 
