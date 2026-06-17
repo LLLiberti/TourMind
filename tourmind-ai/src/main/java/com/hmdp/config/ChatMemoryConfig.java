@@ -1,98 +1,74 @@
 package com.hmdp.config;
 
-import com.hmdp.service.impl.PersistentChatMemory;
-import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.memory.ChatMemory;
 import org.springframework.ai.chat.messages.Message;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.ai.chat.messages.MessageType;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.context.annotation.Primary;
-import org.springframework.data.redis.core.RedisTemplate;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
 
 /**
- * 聊天记忆配置 — 支持内存存储和 Redis 持久化存储两种模式。
+ * 短期记忆配置 — 滑动窗口 + 摘要压缩触发检测。
  *
- * <p>默认使用内存存储（InMemoryChatMemory），零配置、零依赖。
- * 设置 rag.memory.persistent-enabled=true 启用 Redis 持久化（PersistentChatMemory）。</p>
+ * <h3>重构后架构</h3>
+ * <p>实现了 Spring AI {@link ChatMemory} 接口的轻量滑动窗口，
+ * 替代旧版的 {@code InMemoryChatMemory} 和 {@code PersistentChatMemory}。</p>
+ *
+ * <h3>职责分工</h3>
+ * <ul>
+ *   <li><b>短期记忆（本类）</b> — 滑动窗口维护最近 N 轮对话，窗口溢出触发摘要压缩</li>
+ *   <li><b>长期记忆（MemoryCoordinator，Phase D）</b> — MySQL 结构化偏好 + Qdrant 非结构化知识</li>
+ * </ul>
+ *
+ * <h3>参数</h3>
+ * <ul>
+ *   <li>maxMessages: 20 条（= 10 轮对话，每轮 User + Assistant）</li>
+ *   <li>摘要触发阈值: 第 11 轮进入时触发</li>
+ *   <li>无外部依赖: 纯 ConcurrentHashMap，不做持久化（持久化由长期记忆层负责）</li>
+ * </ul>
  */
 @Slf4j
 @Configuration
 public class ChatMemoryConfig {
 
-    /**
-     * 持久化聊天记忆 Bean — 需要 Redis 依赖。
-     * <p>仅当 rag.memory.persistent-enabled=true 时激活。</p>
-     */
+    /** 滑动窗口大小（10 轮 = 20 条消息） */
+    static final int MAX_MESSAGES = 20;
+
+    /** 每 N 轮触发一次摘要压缩检查 */
+    static final int SUMMARY_INTERVAL_ROUNDS = 10;
+
     @Bean
-    @ConditionalOnProperty(prefix = "rag.memory", name = "persistent-enabled", havingValue = "true")
-    @Primary
-    public ChatMemory persistentChatMemory(RedisTemplate<String, String> redisTemplate,
-                                            ConversationConfig convConfig,
-                                            RagConfig ragConfig) {
-        log.info("启用 PersistentChatMemory (Redis 持久化)");
-        return new PersistentChatMemory(redisTemplate,
-                convConfig.getMaxMessages(),
-                convConfig.getMaxConversationsPerUser());
+    public ChatMemory chatMemory() {
+        log.info("短期记忆初始化: ShortTermMemory, maxMessages={}", MAX_MESSAGES);
+        return new ShortTermMemory(MAX_MESSAGES);
     }
 
-    /**
-     * 内存聊天记忆 Bean — 默认实现，无需外部依赖。
-     */
-    @Bean
-    @ConditionalOnProperty(prefix = "rag.memory", name = "persistent-enabled", havingValue = "false",
-            matchIfMissing = true)
-    public ChatMemory chatMemory(ConversationConfig config) {
-        log.info("启用 InMemoryChatMemory (内存存储)");
-        return new InMemoryChatMemory(config);
-    }
+    // ==================== 短期记忆实现 ====================
 
     /**
-     * 基于 ConcurrentHashMap 的纯内存聊天记忆实现
+     * 基于 {@link ConcurrentHashMap} + {@link ConcurrentLinkedDeque} 的轻量滑动窗口。
      */
-    public static class InMemoryChatMemory implements ChatMemory {
+    public static class ShortTermMemory implements ChatMemory {
 
-        /**
-         * 会话消息存储
-         * key   = conversationId ("userId:sessionId")
-         * value = 消息队列（ConcurrentLinkedDeque，线程安全双端队列）
-         */
-        private final ConcurrentHashMap<String, ConcurrentLinkedDeque<Message>> conversations;
-
+        private final ConcurrentHashMap<String, ConcurrentLinkedDeque<Message>> store;
         private final int maxMessages;
-        private final ScheduledExecutorService cleaner;
 
-        public InMemoryChatMemory(ConversationConfig config) {
-            this.conversations = new ConcurrentHashMap<>();
-            this.maxMessages = config.getMaxMessages();
-            this.cleaner = Executors.newSingleThreadScheduledExecutor(r -> {
-                Thread t = new Thread(r, "chat-memory-cleaner");
-                t.setDaemon(true);
-                return t;
-            });
-            log.info("InMemoryChatMemory 初始化完成，消息上限={}", maxMessages);
+        ShortTermMemory(int maxMessages) {
+            this.store = new ConcurrentHashMap<>();
+            this.maxMessages = maxMessages;
         }
 
         @Override
         public void add(String conversationId, Message message) {
-            if (conversationId == null || conversationId.isEmpty() || message == null) {
-                return;
-            }
-
-            ConcurrentLinkedDeque<Message> deque = conversations.computeIfAbsent(
+            if (conversationId == null || conversationId.isEmpty() || message == null) return;
+            ConcurrentLinkedDeque<Message> deque = store.computeIfAbsent(
                     conversationId, k -> new ConcurrentLinkedDeque<>());
-
-            // 滑动窗口：超出上限时移除最旧消息
             while (deque.size() >= maxMessages) {
-                deque.pollFirst();
+                deque.pollFirst();  // FIFO 淘汰最旧消息
             }
             deque.offerLast(message);
         }
@@ -100,46 +76,47 @@ public class ChatMemoryConfig {
         @Override
         public void add(String conversationId, List<Message> messages) {
             if (conversationId == null || conversationId.isEmpty()
-                    || messages == null || messages.isEmpty()) {
-                return;
-            }
-
-            ConcurrentLinkedDeque<Message> deque = conversations.computeIfAbsent(
+                    || messages == null || messages.isEmpty()) return;
+            ConcurrentLinkedDeque<Message> deque = store.computeIfAbsent(
                     conversationId, k -> new ConcurrentLinkedDeque<>());
-
-            for (Message message : messages) {
+            for (Message msg : messages) {
                 while (deque.size() >= maxMessages) {
                     deque.pollFirst();
                 }
-                deque.offerLast(message);
+                deque.offerLast(msg);
             }
         }
 
         @Override
         public List<Message> get(String conversationId) {
-            if (conversationId == null || conversationId.isEmpty()) {
-                return Collections.emptyList();
-            }
-
-            Deque<Message> deque = conversations.get(conversationId);
-            if (deque == null || deque.isEmpty()) {
-                return Collections.emptyList();
-            }
-            return new ArrayList<>(deque);
+            if (conversationId == null || conversationId.isEmpty()) return Collections.emptyList();
+            Deque<Message> deque = store.get(conversationId);
+            return (deque == null || deque.isEmpty())
+                    ? Collections.emptyList()
+                    : new ArrayList<>(deque);
         }
 
         @Override
         public void clear(String conversationId) {
-            if (conversationId != null) {
-                conversations.remove(conversationId);
+            if (conversationId != null && !conversationId.isEmpty()) {
+                store.remove(conversationId);
             }
         }
+    }
 
-        @PreDestroy
-        public void shutdown() {
-            log.info("InMemoryChatMemory 正在关闭，清除 {} 个会话", conversations.size());
-            conversations.clear();
-            cleaner.shutdownNow();
-        }
+    // ==================== 工具方法 ====================
+
+    /** 统计会话的用户消息轮数 */
+    public static int countRounds(ChatMemory memory, String conversationId) {
+        List<Message> messages = memory.get(conversationId);
+        return (int) messages.stream()
+                .filter(m -> m.getMessageType() == MessageType.USER)
+                .count();
+    }
+
+    /** 判断是否应该触发摘要压缩 */
+    public static boolean shouldSummarize(ChatMemory memory, String conversationId) {
+        int rounds = countRounds(memory, conversationId);
+        return rounds > MAX_MESSAGES / 2 && rounds % SUMMARY_INTERVAL_ROUNDS == 0;
     }
 }

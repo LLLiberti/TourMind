@@ -6,6 +6,7 @@ import com.hmdp.dto.Result;
 import com.hmdp.dto.SpotDTO;
 import com.hmdp.entity.Spot;
 import com.hmdp.mapper.SpotMapper;
+import com.hmdp.memory.MemoryCoordinator;
 import com.hmdp.rag.retrieval.HybridDocumentRetriever;
 import com.hmdp.rag.router.QueryRouter;
 import com.hmdp.service.IConversationService;
@@ -74,6 +75,9 @@ public class SpotQAServiceImpl implements ISpotQAService {
     @Resource
     private ReActAgentLoop reActAgentLoop;
 
+    @Resource
+    private MemoryCoordinator memoryCoordinator;
+
     // ==================== 普通问答 → 统一走 Agent 路径 ====================
 
     @Override
@@ -107,6 +111,12 @@ public class SpotQAServiceImpl implements ISpotQAService {
         }
 
         try {
+            // ===== Phase 1: Pre-Task — 读取长期记忆 =====
+            String memoryContext = memoryCoordinator.buildMemoryContext(userId, question);
+            if (!memoryContext.isEmpty()) {
+                reActAgentLoop.setMemoryContext(memoryContext);
+            }
+
             // 执行 ReACT Agent 循环
             AgentResult agentResult = reActAgentLoop.thinkAndActWithPlan(
                     question, conversationId, userX, userY);
@@ -123,6 +133,10 @@ public class SpotQAServiceImpl implements ISpotQAService {
             }
 
             conversationService.incrementMessageCount(conversationId);
+
+            // ===== Phase 3: Post-Task — 异步写入长期记忆 =====
+            memoryCoordinator.extractAndPersist(userId, question, answer,
+                    agentResult.trace().getSteps());
 
             // 构建响应
             List<Spot> retrievedSpots = spotDocumentRetriever.getLastRetrievedSpots();
@@ -148,6 +162,7 @@ public class SpotQAServiceImpl implements ISpotQAService {
             return Result.ok(resultMap);
 
         } finally {
+            reActAgentLoop.clearMemoryContext();
             spotDocumentRetriever.clearContext();
         }
     }

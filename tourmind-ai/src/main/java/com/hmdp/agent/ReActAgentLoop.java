@@ -7,7 +7,6 @@ import com.hmdp.rag.retrieval.HybridDocumentRetriever;
 import com.hmdp.service.ISpotToolService;
 import com.hmdp.service.IWeatherService;
 import com.hmdp.service.impl.ConversationSummaryService;
-import com.hmdp.service.impl.PersistentChatMemory;
 import com.hmdp.tool.SearchKnowledgeBaseTool;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
@@ -81,16 +80,19 @@ public class ReActAgentLoop {
     private HybridDocumentRetriever retriever;
 
     @Resource
-    private com.hmdp.rag.generation.GenerationGuard generationGuard;
+    private GenerationGuard generationGuard;
 
     @Resource
-    private com.hmdp.service.impl.PersistentChatMemory persistentChatMemory;
-
-    @Resource
-    private com.hmdp.service.impl.ConversationSummaryService summaryService;
+    private ConversationSummaryService summaryService;
 
     @Resource
     private RagConfig ragConfig;
+
+    /**
+     * 长期记忆上下文 — 由 MemoryCoordinator（Phase D）在执行前注入。
+     * 含用户画像 + 语义检索记忆，注入到 SystemPrompt 最前面。
+     */
+    private volatile String memoryContext;
 
     @Resource
     private PlannerAgent planner;
@@ -486,18 +488,20 @@ public class ReActAgentLoop {
 
     /**
      * 检查并触发对话摘要压缩。
+     * <p>摘要将存入短期记忆窗口头部，替代被压缩的旧消息。</p>
      */
     private void triggerSummaryIfNeeded(String conversationId,
                                          List<Message> messages, int persistedIdx) {
-        if (conversationId == null || persistentChatMemory == null || summaryService == null) return;
+        if (conversationId == null || summaryService == null) return;
         try {
-            if (persistentChatMemory.shouldSummarize(conversationId)) {
-                List<Message> allMsgs = persistentChatMemory.get(conversationId);
-                String existingSummary = persistentChatMemory.getSummary(conversationId);
-                String newSummary = summaryService.summarize(allMsgs, existingSummary);
+            int rounds = com.hmdp.config.ChatMemoryConfig.countRounds(chatMemory, conversationId);
+            if (rounds > 0 && rounds % 10 == 0 && rounds > 10) {
+                List<Message> allMsgs = chatMemory.get(conversationId);
+                String newSummary = summaryService.summarize(allMsgs);
                 if (!newSummary.isBlank()) {
-                    persistentChatMemory.updateSummary(conversationId, newSummary);
-                    log.info("摘要已更新: conversationId={}, len={}", conversationId, newSummary.length());
+                    memoryContext = (memoryContext != null ? memoryContext + "\n" : "")
+                            + "【对话摘要】" + newSummary;
+                    log.debug("摘要已更新: conversationId={}, len={}", conversationId, newSummary.length());
                 }
             }
         } catch (Exception e) {
@@ -750,26 +754,25 @@ public class ReActAgentLoop {
         return ac.getSystemPrompt() + "\n\n" +
                "【约束】单次对话工具调用总数不超过 " + ac.getMaxIterations() + " 次。" +
                "同一工具+同一参数最多调用 2 次。多个无依赖的工具可以同时调用。" +
-               // 【P1 摘要注入】如果有对话摘要，追加到系统提示
-               buildSummaryInjection();
+               buildMemoryInjection();
     }
 
-    /** 从 PersistentChatMemory 获取摘要并注入到系统提示 */
-    private String buildSummaryInjection() {
-        if (persistentChatMemory == null || summaryService == null) return "";
-        String conversationId = null;
-        try {
-            // 从 RetrievalContext 或 ChatMemory 间接获取 conversationId
-            // conversationId 在 ReActAgentLoop 中作为参数传递，此处从线程上下文获取
-            conversationId = RetrievalContext.current().getLastDiscussedEntity();
-        } catch (Exception ignored) {}
-        if (conversationId == null) return "";
-
-        String summary = persistentChatMemory.getSummary(conversationId);
-        if (summary != null && !summary.isBlank()) {
-            return "\n\n【对话历史摘要】" + summary;
+    /** 获取长期记忆上下文，注入到系统提示最前面 */
+    private String buildMemoryInjection() {
+        if (memoryContext != null && !memoryContext.isBlank()) {
+            return "\n\n" + memoryContext;
         }
         return "";
+    }
+
+    /** 供 MemoryCoordinator 在 Phase 1（Pre-Task）调用，注入长期记忆上下文 */
+    public void setMemoryContext(String memoryContext) {
+        this.memoryContext = memoryContext;
+    }
+
+    /** 清理长期记忆上下文（每次请求结束后调用） */
+    public void clearMemoryContext() {
+        this.memoryContext = null;
     }
 
     // ==================== ChatMemory 持久化 ====================

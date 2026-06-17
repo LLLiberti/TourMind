@@ -111,3 +111,25 @@ rag:
       max-sub-iterations: 3
       sub-timeout-ms: 15000
       max-sub-tasks: 5
+
+# ==================== 记忆模块配置 ====================
+memory:
+  # 短期记忆（滑动窗口）
+  short-term:
+    max-messages: 20              # 10轮 × 2条/轮
+    summary-interval-rounds: 10   # 每10轮检查一次摘要压缩
+
+  # 长期记忆 — MySQL 结构化偏好（UserProfileStore）
+  longterm:
+    mysql:
+      enabled: true
+    # 长期记忆 — Qdrant 非结构化知识（KnowledgeMemoryStore）
+    qdrant:
+      enabled: true
+      collection-name: user_memories
+
+  # 记忆提取器
+  extractor:
+    enabled: true                 # 设为 false 可关闭记忆提取（降级时使用）
+    async: true                   # 异步执行
+

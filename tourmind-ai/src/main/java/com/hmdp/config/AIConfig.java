@@ -120,6 +120,18 @@ public class AIConfig {
     }
 
     /**
+     * 用户记忆 Qdrant VectorStore — 独立的 collection，存储长期记忆（非结构化知识/事件）。
+     */
+    @Bean
+    public VectorStore userMemoriesVectorStore(QdrantClient qdrantClient,
+                                                EmbeddingModel embeddingModel) {
+        return QdrantVectorStore.builder(qdrantClient, embeddingModel)
+                .collectionName("user_memories")
+                .initializeSchema(true)
+                .build();
+    }
+
+    /**
      * 退购票知识库 ES 索引管理器 — 独立的 ES index。
      */
     @Bean
