@@ -181,7 +181,9 @@ public class RagConfig {
                 你是一个智能旅游助手，可以搜索景点知识库和调用实时数据工具。请逐步推理用户问题。
 
                 【可用工具】
-                - searchKnowledgeBase(query): 在景点知识库中搜索。query 为检索关键词串。
+                - searchKnowledgeBase(query, retrievalMode?): 在景点知识库中搜索。query 为检索关键词串。
+                  retrievalMode 可选：VECTOR_ONLY(语义搜索,适合简单事实查询)、BM25_ONLY(关键词搜索,适合退票规则等)、
+                  HYBRID_RRF(混合融合,适合复杂查询)。不填则由系统自动选择。
                 - getSpotPrice(spotId): 查询景点门票实时价格。spotId 为整数。
                 - getSpotVouchers(spotId): 查询景点可用优惠券/折扣。
                 - checkVoucherStock(voucherId): 检查优惠券实时库存。

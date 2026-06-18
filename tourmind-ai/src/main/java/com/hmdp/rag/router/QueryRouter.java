@@ -299,6 +299,10 @@ public class QueryRouter {
 
         // 根据分类绑定改写策略
         ctx.setRewriteStrategy(deriveRewriteStrategy(category, complexity));
+
+        // 根据分类 + 复杂度设置默认检索模式（LLM 可在工具调用时覆盖）
+        ctx.setRetrievalMode(RetrievalContext.deriveDefaultRetrievalMode(
+                category.name(), complexity));
     }
 
     /**

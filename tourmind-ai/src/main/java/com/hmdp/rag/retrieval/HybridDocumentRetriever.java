@@ -6,6 +6,7 @@ import com.hmdp.entity.SpotType;
 import com.hmdp.mapper.SpotMapper;
 import com.hmdp.mapper.SpotTypeMapper;
 import com.hmdp.rag.RetrievalContext;
+import com.hmdp.rag.RetrievalMode;
 import com.hmdp.rag.client.QwenRerankClient;
 import com.hmdp.rag.evaluation.RetrievalEvaluator;
 import com.hmdp.rag.router.TicketRefundConstants;
@@ -137,56 +138,122 @@ public class HybridDocumentRetriever implements DocumentRetriever {
 
     // ==================== 主知识库检索管线 ====================
 
+    /**
+     * 模式分发入口：根据 RetrievalContext 中的 retrievalMode 选择检索管线。
+     */
     private List<Document> retrieveMainKB(String queryText) {
+        RetrievalMode mode = RetrievalContext.current().getRetrievalMode();
+        if (mode == null) mode = RetrievalMode.HYBRID_RRF;
+
         RagConfig.EsConfig esConfig = ragConfig.getEs();
         int maxContextSpots = ragConfig.getMaxContextSpots();
 
-        // ① Qdrant 向量检索（仅子文档）
-        List<Document> vectorDocs = vectorSearch(queryText, esConfig.getTopK());
+        log.debug("主KB 检索模式: {}", mode);
+
+        return switch (mode) {
+            case VECTOR_ONLY -> retrieveVectorOnly(queryText, esConfig.getTopK(), maxContextSpots);
+            case BM25_ONLY   -> retrieveBm25Only(queryText, esConfig.getTopK(), maxContextSpots);
+            case HYBRID_RRF  -> retrieveHybridRrf(queryText, esConfig.getTopK(), maxContextSpots);
+        };
+    }
+
+    // ---- VECTOR_ONLY ----
+
+    /**
+     * 仅向量检索：Qdrant → 提取 spotId → 公共尾部。
+     * <p>跳过 ES BM25、RRF、重排、MMR。</p>
+     */
+    private List<Document> retrieveVectorOnly(String queryText, int defaultTopK, int maxContextSpots) {
+        int adaptiveTopK = computeAdaptiveTopK(defaultTopK);
+        List<Document> vectorDocs = vectorSearch(queryText, adaptiveTopK);
+        log.debug("主KB VECTOR_ONLY: Qdrant 命中 {} 条 (topK={})", vectorDocs.size(), adaptiveTopK);
+
+        if (vectorDocs.isEmpty()) {
+            clearContext();
+            return Collections.emptyList();
+        }
+
+        List<Long> spotIds = vectorDocs.stream()
+                .map(doc -> doc.getMetadata().get("spotId"))
+                .filter(Objects::nonNull)
+                .map(obj -> {
+                    try { return Long.valueOf(obj.toString()); }
+                    catch (NumberFormatException e) { return null; }
+                })
+                .filter(Objects::nonNull)
+                .distinct()
+                .limit(maxContextSpots)
+                .collect(Collectors.toList());
+
+        return finishRetrieval(spotIds);
+    }
+
+    // ---- BM25_ONLY ----
+
+    /**
+     * 仅 BM25 关键词检索：ES BM25 → 提取 spotId → 公共尾部。
+     * <p>跳过 Qdrant 向量、RRF、重排、MMR。</p>
+     */
+    private List<Document> retrieveBm25Only(String queryText, int defaultTopK, int maxContextSpots) {
+        int adaptiveTopK = computeAdaptiveTopK(defaultTopK);
+        List<RrfRankFuser.ScoredDoc> esResults = esBm25Retriever.search(queryText, adaptiveTopK);
+        log.debug("主KB BM25_ONLY: ES 命中 {} 条 (topK={})", esResults.size(), adaptiveTopK);
+
+        if (esResults.isEmpty()) {
+            clearContext();
+            return Collections.emptyList();
+        }
+
+        List<Long> spotIds = esResults.stream()
+                .map(RrfRankFuser.ScoredDoc::getSpotId)
+                .filter(Objects::nonNull)
+                .map(id -> {
+                    try { return Long.valueOf(id); }
+                    catch (NumberFormatException e) { return null; }
+                })
+                .filter(Objects::nonNull)
+                .distinct()
+                .limit(maxContextSpots)
+                .collect(Collectors.toList());
+
+        return finishRetrieval(spotIds);
+    }
+
+    // ---- HYBRID_RRF ----
+
+    /**
+     * 混合检索（原有管线）：Qdrant + BM25 + RRF 融合 + 可选重排 + MMR → 公共尾部。
+     */
+    private List<Document> retrieveHybridRrf(String queryText, int esTopK, int maxContextSpots) {
+        List<Document> vectorDocs = vectorSearch(queryText, esTopK);
         log.debug("主KB Qdrant 检索命中 {} 条", vectorDocs.size());
 
-        // ② ES BM25 关键词检索
-        List<RrfRankFuser.ScoredDoc> esResults = esBm25Retriever.search(queryText, esConfig.getTopK());
+        List<RrfRankFuser.ScoredDoc> esResults = esBm25Retriever.search(queryText, esTopK);
         log.debug("主KB ES BM25 检索命中 {} 条", esResults.size());
 
-        // 如果两路都为空，返回空
         if (vectorDocs.isEmpty() && esResults.isEmpty()) {
             clearContext();
             return Collections.emptyList();
         }
 
-        return buildMainResults(queryText, vectorDocs, esResults, maxContextSpots);
-    }
-
-    private List<Document> buildMainResults(String queryText, List<Document> vectorDocs,
-                                             List<RrfRankFuser.ScoredDoc> esResults,
-                                             int maxContextSpots) {
         RagConfig.RrfConfig rrfConfig = ragConfig.getRrf();
-
-        // 【P1 自适应检索】根据复杂度调整 topK
         int adaptiveTopK = computeAdaptiveTopK(rrfConfig.getTopK());
 
-        // ③ 转换为统一 ScoredDoc 格式
         List<RrfRankFuser.ScoredDoc> vecScored = fromVectorResults(vectorDocs);
-
-        // ④ RRF 排名融合
         List<RrfRankFuser.FusedResult> fused = rrfRankFuser.fuse(
                 esResults, vecScored, adaptiveTopK);
         log.debug("主KB RRF 融合: {} 个候选 (adaptive topK={})", fused.size(), adaptiveTopK);
 
-        // ⑤ 重排（可选，自适应启用）
         if (rerankClient != null && shouldEnableRerank()) {
             fused = applyRerank(queryText, fused);
         }
 
-        // ⑥ 【P1 MMR 多样性】在提取 spotId 前应用 MMR
         if (mmrDiversifier != null && ragConfig.getMmr().isEnabled()) {
             int mmrTopK = Math.min(fused.size(), maxContextSpots);
             fused = mmrDiversifier.diversify(fused, mmrTopK);
             log.debug("MMR 多样性重排: {} 个候选", fused.size());
         }
 
-        // ⑦ 提取 spotId 列表
         List<Long> spotIds = fused.stream()
                 .map(fr -> {
                     try { return Long.valueOf(fr.getSpotId()); }
@@ -197,12 +264,22 @@ public class HybridDocumentRetriever implements DocumentRetriever {
                 .limit(maxContextSpots)
                 .collect(Collectors.toList());
 
+        return finishRetrieval(spotIds);
+    }
+
+    // ---- 公共尾部 ----
+
+    /**
+     * 公共尾部管线：DB 批量查询 → 距离排序 → ThreadLocal 缓存 → 父文档加载。
+     * <p>所有检索模式在提取 spotId 列表后都走此方法。</p>
+     */
+    private List<Document> finishRetrieval(List<Long> spotIds) {
         if (spotIds.isEmpty()) {
             clearContext();
             return Collections.emptyList();
         }
 
-        // ⑧ DB 批量查询（保持融合排序）
+        // DB 批量查询（保持 spotIds 顺序）
         List<Spot> spots = spotMapper.selectBatchIds(spotIds);
         Map<Long, Spot> spotMap = spots.stream()
                 .collect(Collectors.toMap(Spot::getId, Function.identity(), (a, b) -> a));
@@ -211,16 +288,16 @@ public class HybridDocumentRetriever implements DocumentRetriever {
                 .filter(Objects::nonNull)
                 .collect(Collectors.toList());
 
-        // ⑨ 距离排序
+        // 距离排序
         RetrievalContext ctx = RetrievalContext.current();
         if (ctx.getUserX() != null && ctx.getUserY() != null) {
             orderedSpots = sortByDistance(orderedSpots, ctx.getUserX(), ctx.getUserY());
         }
 
-        // ⑩ ThreadLocal 缓存
+        // ThreadLocal 缓存
         ctx.setRetrievedSpots(orderedSpots);
 
-        // ⑪ 加载父文档全文 → 构造返回 Document
+        // 加载父文档全文 → 构造返回 Document
         return orderedSpots.stream()
                 .map(this::spotToParentDocument)
                 .collect(Collectors.toList());

@@ -110,9 +110,18 @@ public class ReActAgentLoop {
             toolCallbacks = List.of(
                     createTool("searchKnowledgeBase",
                             "在景点知识库中搜索景点信息。需要查询景点的介绍、位置、评分、开放时间等静态信息时调用。" +
-                            "参数 query 为检索关键词串。",
+                            "参数 query 为检索关键词串。" +
+                            "可选参数 retrievalMode 指定检索模式：" +
+                            "VECTOR_ONLY 适合简单事实查询(如评分/时间/地址)，" +
+                            "BM25_ONLY 适合关键词精确匹配(如退票规则/购票须知)，" +
+                            "HYBRID_RRF 适合复杂推荐/对比查询。" +
+                            "不填则由系统根据查询类型自动选择。",
                             """
-                            {"type":"object","properties":{"query":{"type":"string","description":"检索关键词串"}},"required":["query"]}""",
+                            {"type":"object","properties":{
+                              "query":{"type":"string","description":"检索关键词串"},
+                              "retrievalMode":{"type":"string","enum":["VECTOR_ONLY","BM25_ONLY","HYBRID_RRF"],
+                                "description":"检索模式，可选。VECTOR_ONLY=语义搜索,BM25_ONLY=关键词搜索,HYBRID_RRF=混合融合。不填则自动选择"}
+                            },"required":["query"]}""",
                             searchTool::execute),
                     createTool("getSpotPrice",
                             "获取指定景点的门票实时价格。spotId 为整数景点ID。",

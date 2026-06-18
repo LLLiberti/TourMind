@@ -82,6 +82,9 @@ public class RetrievalContext {
     /** 查询改写策略（KEYWORD / MULTI_QUERY / HYDE / MULTI_HYDE） */
     private String rewriteStrategy = "KEYWORD";
 
+    /** 检索模式（VECTOR_ONLY / BM25_ONLY / HYBRID_RRF），LLM 可在工具调用时覆盖 */
+    private RetrievalMode retrievalMode = RetrievalMode.HYBRID_RRF;
+
     // ==================== Getters & Setters ====================
 
     public Double getUserX() { return userX; }
@@ -131,4 +134,22 @@ public class RetrievalContext {
 
     public String getRewriteStrategy() { return rewriteStrategy; }
     public void setRewriteStrategy(String rewriteStrategy) { this.rewriteStrategy = rewriteStrategy; }
+
+    public RetrievalMode getRetrievalMode() { return retrievalMode; }
+    public void setRetrievalMode(RetrievalMode retrievalMode) { this.retrievalMode = retrievalMode; }
+
+    /**
+     * 根据查询分类 + 复杂度推导默认检索模式。
+     * <p>由 QueryRouter 在 classify() 时调用，写入上下文。LLM 后续可通过
+     * searchKnowledgeBase 的 retrievalMode 参数覆盖。</p>
+     */
+    public static RetrievalMode deriveDefaultRetrievalMode(String category, int complexity) {
+        if (category == null) return RetrievalMode.HYBRID_RRF;
+        return switch (category) {
+            case "FACT_LOOKUP"   -> complexity <= 2 ? RetrievalMode.VECTOR_ONLY : RetrievalMode.HYBRID_RRF;
+            case "TICKET_REFUND" -> RetrievalMode.BM25_ONLY;
+            case "RECOMMENDATION", "COMPARISON", "COMPLEX" -> RetrievalMode.HYBRID_RRF;
+            default              -> complexity <= 2 ? RetrievalMode.VECTOR_ONLY : RetrievalMode.HYBRID_RRF;
+        };
+    }
 }

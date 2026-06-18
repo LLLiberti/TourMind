@@ -1,5 +1,7 @@
 package com.hmdp.tool;
 
+import com.hmdp.rag.RetrievalContext;
+import com.hmdp.rag.RetrievalMode;
 import com.hmdp.rag.cache.RetrievalCacheManager;
 import com.hmdp.rag.evaluation.CragCorrector;
 import com.hmdp.rag.generation.GenerationGuard;
@@ -54,9 +56,11 @@ public class SearchKnowledgeBaseTool {
     private static final int MAX_DOCS_TO_SHOW = 5;
 
     /**
-     * 执行知识库检索（P1 增强版：缓存 + CRAG + Citation）。
+     * 执行知识库检索（P1 增强版：缓存 + CRAG + Citation + 灵活检索模式）。
      *
-     * <p>管线：缓存查询 → 指代消解 → 查询改写 → 混合检索 → CRAG纠正 → Citation注入</p>
+     * <p>管线：缓存查询 → 指代消解 → 查询改写 → [模式选择] → 混合检索 → CRAG纠正 → Citation注入</p>
+     *
+     * <p>LLM 可通过 retrievalMode 参数覆盖 QueryRouter 的默认检索模式。</p>
      */
     public String execute(String queryJson) {
         String query = extractQuery(queryJson);
@@ -65,6 +69,9 @@ public class SearchKnowledgeBaseTool {
         }
 
         log.info("SearchKB: query='{}'", query);
+
+        // 解析 LLM 指定的检索模式（可选），覆盖 QueryRouter 默认值
+        applyRetrievalMode(queryJson, query);
 
         // 0. 缓存查询
         if (cacheManager != null) {
@@ -157,31 +164,49 @@ public class SearchKnowledgeBaseTool {
     }
 
     /**
+     * 应用 LLM 指定的检索模式（如果有效），覆盖 QueryRouter 的默认值。
+     */
+    private void applyRetrievalMode(String jsonArgs, String query) {
+        String modeStr = extractJsonString(jsonArgs, "retrievalMode");
+        if (modeStr == null || modeStr.isBlank()) {
+            log.debug("SearchKB: 未指定检索模式，使用 QueryRouter 默认值={}",
+                    RetrievalContext.current().getRetrievalMode());
+            return;
+        }
+        try {
+            RetrievalMode mode = RetrievalMode.valueOf(modeStr.toUpperCase());
+            RetrievalContext.current().setRetrievalMode(mode);
+            log.info("SearchKB: LLM 指定检索模式={} (query='{}')", mode, query);
+        } catch (IllegalArgumentException e) {
+            log.warn("SearchKB: 未知检索模式 '{}'，保持默认 (query='{}')", modeStr, query);
+        }
+    }
+
+    /**
+     * 从 JSON 字符串中提取指定字段名的字符串值。
+     * @return 字段值，未找到则返回 null
+     */
+    private String extractJsonString(String json, String fieldName) {
+        if (json == null || json.isBlank()) return null;
+        String key = "\"" + fieldName + "\"";
+        int keyIdx = json.indexOf(key);
+        if (keyIdx < 0) return null;
+        int colonIdx = json.indexOf(':', keyIdx + key.length());
+        if (colonIdx < 0) return null;
+        int startQuote = json.indexOf('"', colonIdx + 1);
+        if (startQuote < 0) return null;
+        int endQuote = json.indexOf('"', startQuote + 1);
+        if (endQuote < 0) return null;
+        return json.substring(startQuote + 1, endQuote);
+    }
+
+    /**
      * 从 JSON 参数中提取 query 字段。
      */
     private String extractQuery(String jsonArgs) {
-        if (jsonArgs == null || jsonArgs.isBlank()) {
-            return null;
-        }
-        // 简单 JSON 解析（不引入额外依赖）
-        String key = "\"query\"";
-        int keyIdx = jsonArgs.indexOf(key);
-        if (keyIdx < 0) {
-            return jsonArgs.trim(); // 可能是纯文本
-        }
-        int colonIdx = jsonArgs.indexOf(':', keyIdx + key.length());
-        if (colonIdx < 0) {
-            return jsonArgs.trim();
-        }
-        int startQuote = jsonArgs.indexOf('"', colonIdx + 1);
-        if (startQuote < 0) {
-            return jsonArgs.substring(colonIdx + 1).trim();
-        }
-        int endQuote = jsonArgs.indexOf('"', startQuote + 1);
-        if (endQuote < 0) {
-            return jsonArgs.substring(startQuote + 1).trim();
-        }
-        return jsonArgs.substring(startQuote + 1, endQuote);
+        if (jsonArgs == null || jsonArgs.isBlank()) return null;
+        String result = extractJsonString(jsonArgs, "query");
+        return result != null ? result : jsonArgs.trim(); // 回退：纯文本
     }
 
     /**
