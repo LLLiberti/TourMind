@@ -1,12 +1,15 @@
 package com.hmdp.service.impl;
 
 import com.hmdp.agent.AgentResult;
+import com.hmdp.agent.AgentStep;
+import com.hmdp.agent.AgentTrace;
 import com.hmdp.agent.ReActAgentLoop;
 import com.hmdp.dto.Result;
 import com.hmdp.dto.SpotDTO;
 import com.hmdp.entity.Spot;
 import com.hmdp.mapper.SpotMapper;
 import com.hmdp.memory.MemoryCoordinator;
+import com.hmdp.rag.RetrievalContext;
 import com.hmdp.rag.retrieval.HybridDocumentRetriever;
 import com.hmdp.rag.router.QueryRouter;
 import com.hmdp.service.IConversationService;
@@ -96,30 +99,49 @@ public class SpotQAServiceImpl implements ISpotQAService {
             return Result.fail("问题不能为空");
         }
 
+        long t0 = System.currentTimeMillis();
+
         String conversationId = conversationService.getOrCreateConversation(userId, sessionId);
 
         // Adaptive 分流 — 闲聊跳过 Agent，复用现有闲聊路径
+        long tRouterStart = System.currentTimeMillis();
         QueryRouter.Category category = queryRouter.classify(question);
+        long routerMs = System.currentTimeMillis() - tRouterStart;
         log.info("Agent 分流: query='{}' → category={}", question, category);
 
         if (category == QueryRouter.Category.CHITCHAT) {
             try {
-                return answerChitchat(question, conversationId, limit);
+                Result result = answerChitchat(question, conversationId, limit);
+                long totalMs = System.currentTimeMillis() - t0;
+                // 闲聊场景也附加计时
+                addTimingToResult(result, Map.of(
+                        "routerMs", routerMs,
+                        "totalMs", totalMs
+                ));
+                return result;
             } finally {
                 spotDocumentRetriever.clearContext();
             }
         }
 
+        long preTaskMs = 0;
+        long agentMs = 0;
+        long postProcessMs = 0;
+
         try {
             // ===== Phase 1: Pre-Task — 读取长期记忆 =====
+            long tPreTask = System.currentTimeMillis();
             String memoryContext = memoryCoordinator.buildMemoryContext(userId, question);
             if (!memoryContext.isEmpty()) {
                 reActAgentLoop.setMemoryContext(memoryContext);
             }
+            preTaskMs = System.currentTimeMillis() - tPreTask;
 
             // 执行 ReACT Agent 循环
+            long tAgent = System.currentTimeMillis();
             AgentResult agentResult = reActAgentLoop.thinkAndActWithPlan(
                     question, conversationId, userX, userY);
+            agentMs = System.currentTimeMillis() - tAgent;
             String answer = agentResult.answer();
 
             log.info("Agent trace: {} steps, hitMaxIterations={}",
@@ -134,11 +156,12 @@ public class SpotQAServiceImpl implements ISpotQAService {
 
             conversationService.incrementMessageCount(conversationId);
 
-            // ===== Phase 3: Post-Task — 异步写入长期记忆 =====
-            memoryCoordinator.extractAndPersist(userId, question, answer,
+            // ===== Phase 3: Post-Task — 缓冲本轮并异步批量提取长期记忆 =====
+            memoryCoordinator.extractAndPersist(userId, conversationId, question, answer,
                     agentResult.trace().getSteps());
 
             // 构建响应
+            long tPost = System.currentTimeMillis();
             List<Spot> retrievedSpots = spotDocumentRetriever.getLastRetrievedSpots();
             Map<Long, Double> distanceMap = spotDocumentRetriever.getLastSpotDistances();
             List<SpotDTO> spotDTOs = retrievedSpots.stream()
@@ -159,6 +182,17 @@ public class SpotQAServiceImpl implements ISpotQAService {
             resultMap.put("queryComplexity", spotDocumentRetriever.getLastQueryComplexity());
             resultMap.put("retrievalConfidence", confidence != null ? confidence : "UNKNOWN");
             resultMap.put("agentTrace", agentResult.trace());
+
+            // ===== 链路耗时 =====
+            postProcessMs = System.currentTimeMillis() - tPost;
+            long totalMs = System.currentTimeMillis() - t0;
+            resultMap.put("phaseTiming", buildPhaseTiming(
+                    preTaskMs, routerMs, agentMs, postProcessMs, totalMs,
+                    agentResult.trace()));
+
+            // 附加 RAG 管线细分计时（来自 RetrievalContext）
+            appendRagTiming(resultMap);
+
             return Result.ok(resultMap);
 
         } finally {
@@ -235,6 +269,8 @@ public class SpotQAServiceImpl implements ISpotQAService {
     public void clearConversation(Long userId, String sessionId) {
         if (userId != null && sessionId != null) {
             conversationService.clearConversation(userId, sessionId);
+            // 清除时触发 Session 缓冲 flush（提取未满 10 轮的剩余对话）
+            memoryCoordinator.flushSession(conversationService.getOrCreateConversation(userId, sessionId), userId);
             log.info("已清除会话历史：userId={}, sessionId={}", userId, sessionId);
         }
     }
@@ -274,6 +310,74 @@ public class SpotQAServiceImpl implements ISpotQAService {
             sb.append("\n");
         }
         return sb.toString();
+    }
+
+    // ==================== 链路耗时工具方法 ====================
+
+    /**
+     * 构建阶段级链路耗时数据。
+     */
+    private Map<String, Object> buildPhaseTiming(long preTaskMs, long routerMs, long agentMs,
+                                                  long postProcessMs, long totalMs,
+                                                  AgentTrace agentTrace) {
+        Map<String, Object> timing = new LinkedHashMap<>();
+        timing.put("preTaskMs", preTaskMs);
+        timing.put("routerMs", routerMs);
+        timing.put("agentMs", agentMs);
+        timing.put("postProcessMs", postProcessMs);
+        timing.put("totalMs", totalMs);
+
+        // 统计 Agent 内部工具调用耗时
+        if (agentTrace != null && agentTrace.getSteps() != null) {
+            long toolTotalMs = 0;
+            int toolCallCount = 0;
+            for (AgentStep step : agentTrace.getSteps()) {
+                if ("TOOL_CALL".equals(step.getType())) {
+                    toolTotalMs += step.getDurationMs();
+                    toolCallCount++;
+                }
+            }
+            timing.put("agentToolCalls", toolCallCount);
+            timing.put("agentToolTotalMs", toolTotalMs);
+            timing.put("agentIterations", agentTrace.getTotalIterations());
+        }
+
+        return timing;
+    }
+
+    /**
+     * 附加 RAG 管线细分计时（从 RetrievalContext ThreadLocal 读取）。
+     */
+    private void appendRagTiming(Map<String, Object> resultMap) {
+        try {
+            RetrievalContext ctx = RetrievalContext.current();
+            Map<String, Object> ragTiming = new LinkedHashMap<>();
+            ragTiming.put("cacheQueryMs", ctx.getCacheQueryMs());
+            ragTiming.put("compressionMs", ctx.getCompressionMs());
+            ragTiming.put("rewriteMs", ctx.getRewriteMs());
+            ragTiming.put("retrievalMs", ctx.getRetrievalMs());
+            ragTiming.put("cragMs", ctx.getCragMs());
+            ragTiming.put("formatMs", ctx.getFormatMs());
+            ragTiming.put("ragTotalMs", ctx.getRagTotalMs());
+            resultMap.put("ragTiming", ragTiming);
+        } catch (Exception e) {
+            log.debug("RAG 计时读取失败: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * 向已有 Result 的 data map 附加计时字段（用于闲聊等快捷路径）。
+     */
+    private void addTimingToResult(Result result, Map<String, Object> timing) {
+        if (result == null || result.getData() == null) return;
+        Object data = result.getData();
+        if (data instanceof Map) {
+            // 防御不可变 Map（如 Map.of）→ 复制后写入
+            @SuppressWarnings("unchecked")
+            Map<String, Object> mutable = new LinkedHashMap<>((Map<String, Object>) data);
+            mutable.put("phaseTiming", timing);
+            result.setData(mutable);
+        }
     }
 
 }

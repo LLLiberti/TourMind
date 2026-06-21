@@ -1,6 +1,7 @@
 package com.hmdp.memory;
 
 import com.hmdp.entity.memory.MemoryEntry;
+import com.hmdp.entity.memory.SessionSummary;
 import com.hmdp.entity.memory.UserProfile;
 
 import java.util.List;
@@ -13,12 +14,15 @@ import java.util.List;
  * [用户画像]
  * - 偏好景点类型: 自然风光、历史古迹
  * - 预算水平: 中等
- * ...
+ *
+ * [近期对话摘要]
+ * - 话题：杭州亲子游景点推荐与门票对比
+ *   摘要：用户从询问西湖开始，逐步聚焦到亲子景点...
+ *   用户目标：寻找适合带孩子的景点，预算中等
+ *   当前焦点：杭州动物园门票和优惠券
  *
  * [相关历史记忆]
- * - 上次询问过杭州动物园，对动物主题景点感兴趣
  * - 用户偏好安静人少的景点
- * ...
  * </pre>
  */
 public class MemoryContextBuilder {
@@ -27,12 +31,10 @@ public class MemoryContextBuilder {
 
     /**
      * 构建注入到 SystemPrompt 的长期记忆上下文。
-     *
-     * @param profile          用户画像（可为 null）
-     * @param semanticMemories 语义检索到的历史记忆
-     * @return 上下文文本，无有效数据时返回空串
      */
-    public static String build(UserProfile profile, List<MemoryEntry> semanticMemories) {
+    public static String build(UserProfile profile,
+                               List<SessionSummary> sessionSummaries,
+                               List<MemoryEntry> semanticMemories) {
         StringBuilder sb = new StringBuilder();
 
         // Section 1: 用户画像
@@ -40,7 +42,16 @@ public class MemoryContextBuilder {
             sb.append(profile.toContextText());
         }
 
-        // Section 2: 语义记忆
+        // Section 2: 近期会话摘要（MySQL session_summary）
+        if (sessionSummaries != null && !sessionSummaries.isEmpty()) {
+            if (!sb.isEmpty()) sb.append(SECTION_SEPARATOR);
+            sb.append("【近期对话摘要】\n");
+            for (SessionSummary s : sessionSummaries) {
+                sb.append(s.toContextLine());
+            }
+        }
+
+        // Section 3: 语义记忆（Qdrant）
         if (semanticMemories != null && !semanticMemories.isEmpty()) {
             if (!sb.isEmpty()) sb.append(SECTION_SEPARATOR);
             sb.append("【相关历史记忆】\n");
@@ -54,19 +65,16 @@ public class MemoryContextBuilder {
         return sb.toString().trim();
     }
 
-    /**
-     * 仅使用用户画像构建上下文（无语义记忆时使用）。
-     */
     public static String buildFromProfile(UserProfile profile) {
-        return build(profile, null);
+        return build(profile, null, null);
     }
 
-    /**
-     * 判断是否有需要注入的内存上下文。
-     */
-    public static boolean hasMemoryContext(UserProfile profile, List<MemoryEntry> semanticMemories) {
+    public static boolean hasMemoryContext(UserProfile profile,
+                                           List<SessionSummary> sessionSummaries,
+                                           List<MemoryEntry> semanticMemories) {
         boolean hasProfile = profile != null && profile.hasPreferences();
+        boolean hasSummaries = sessionSummaries != null && !sessionSummaries.isEmpty();
         boolean hasMemories = semanticMemories != null && !semanticMemories.isEmpty();
-        return hasProfile || hasMemories;
+        return hasProfile || hasSummaries || hasMemories;
     }
 }

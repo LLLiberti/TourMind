@@ -63,6 +63,7 @@ public class SearchKnowledgeBaseTool {
      * <p>LLM 可通过 retrievalMode 参数覆盖 QueryRouter 的默认检索模式。</p>
      */
     public String execute(String queryJson) {
+        long t0 = System.currentTimeMillis();
         String query = extractQuery(queryJson);
         if (query == null || query.isBlank()) {
             return "[检索结果] 查询参数为空，请提供有效的检索关键词。";
@@ -74,10 +75,13 @@ public class SearchKnowledgeBaseTool {
         applyRetrievalMode(queryJson, query);
 
         // 0. 缓存查询
+        long tCacheStart = System.currentTimeMillis();
         if (cacheManager != null) {
             String cached = cacheManager.get(query);
             if (cached != null) {
                 log.info("SearchKB: 缓存命中");
+                RetrievalContext.current().setCacheQueryMs(System.currentTimeMillis() - tCacheStart);
+                RetrievalContext.current().setRagTotalMs(System.currentTimeMillis() - t0);
                 return cached;
             }
         }
@@ -85,27 +89,34 @@ public class SearchKnowledgeBaseTool {
         Query q = Query.builder().text(query).build();
 
         // 1. 多轮指代消解
+        long tCompress = System.currentTimeMillis();
         if (compressor != null) {
             q = compressor.transform(q);
             log.debug("SearchKB: compressed='{}'", q.text());
         }
+        long compressMs = System.currentTimeMillis() - tCompress;
 
         // 2. Query 改写
+        long tRewrite = System.currentTimeMillis();
         Query rewritten = rewriter.transform(q);
+        long rewriteMs = System.currentTimeMillis() - tRewrite;
         log.debug("SearchKB: rewritten='{}'", rewritten.text());
 
         // 3. 混合检索
+        long tRetrieval = System.currentTimeMillis();
         List<Document> docs = retriever.retrieve(rewritten);
         List<Query> expandedQueries = rewriter.getLastExpandedQueries();
         if (expandedQueries != null && !expandedQueries.isEmpty()) {
             docs = mergeMultiQueryResults(docs, expandedQueries);
         }
+        long retrievalMs = System.currentTimeMillis() - tRetrieval;
 
         // 4. 读取置信度
         String confidence = retriever.getLastRetrievalConfidence();
         double maxScore = retriever.getLastMaxRetrievalScore();
 
         // 5. 【P1 CRAG 纠正】检索不足时自动纠正
+        long tCrag = System.currentTimeMillis();
         if ("INSUFFICIENT".equals(confidence) && cragCorrector != null) {
             CragCorrector.CorrectionResult cr = cragCorrector.correct(query, maxScore);
             if (!cr.getCorrectedQuery().equals(query)) {
@@ -128,14 +139,27 @@ public class SearchKnowledgeBaseTool {
                 log.info("CRAG: 追加 {} 条 web 摘要", cr.getWebSnippets().size());
             }
         }
+        long cragMs = System.currentTimeMillis() - tCrag;
 
         // 6. 格式化输出（含 Citation 指令）
+        long tFormat = System.currentTimeMillis();
         String result = formatResults(docs, confidence, maxScore);
+        long formatMs = System.currentTimeMillis() - tFormat;
 
         // 7. 写入缓存
         if (cacheManager != null) {
             cacheManager.put(query, result);
         }
+
+        // 写入计时到 RetrievalContext
+        RetrievalContext ctx = RetrievalContext.current();
+        ctx.setCacheQueryMs(System.currentTimeMillis() - tCacheStart - compressMs - rewriteMs - retrievalMs - cragMs - formatMs);
+        ctx.setCompressionMs(compressMs);
+        ctx.setRewriteMs(rewriteMs);
+        ctx.setRetrievalMs(retrievalMs);
+        ctx.setCragMs(cragMs);
+        ctx.setFormatMs(formatMs);
+        ctx.setRagTotalMs(System.currentTimeMillis() - tCacheStart);
 
         return result;
     }

@@ -19,9 +19,16 @@ import java.util.stream.Collectors;
  *
  * <p>Collection: user_memories（需在 Qdrant 中预先创建或通过 initializeSchema=true 自动创建）。
  * Embedding: Ollama bge-m3（复用现有配置）。</p>
+ *
+ * <h3>去重策略</h3>
+ * <p>写入前对同 userId 做语义相似检索，若已有高度相似记忆（score > 0.85），
+ * 跳过写入避免 Qdrant 中堆积重复内容。</p>
  */
 @Slf4j
 public class UserKnowledgeMemoryStoreImpl implements UserKnowledgeMemoryStore {
+
+    /** 去重相似度阈值：新记忆与已有记忆相似度 >= 此值时跳过写入 */
+    private static final double DEDUP_THRESHOLD = 0.85;
 
     /**
      * 名为 "userMemoriesVectorStore" 的 Qdrant VectorStore，
@@ -35,6 +42,13 @@ public class UserKnowledgeMemoryStoreImpl implements UserKnowledgeMemoryStore {
 
     @Override
     public String store(Long userId, String content, String memoryType, int importance) {
+        // 去重：搜索同 userId 下的相似记忆
+        if (isDuplicate(userId, content)) {
+            log.debug("KnowledgeMemory: 跳过重复记忆, userId={}, content='{}'",
+                    userId, content.length() > 40 ? content.substring(0, 40) + "..." : content);
+            return null;
+        }
+
         String docId = UUID.randomUUID().toString();
         Map<String, Object> metadata = Map.of(
                 "userId", userId,
@@ -46,6 +60,28 @@ public class UserKnowledgeMemoryStoreImpl implements UserKnowledgeMemoryStore {
         vectorStore.add(List.of(doc));
         log.debug("KnowledgeMemory 存储: userId={}, type={}, importance={}", userId, memoryType, importance);
         return docId;
+    }
+
+    /**
+     * 检查是否已存在高度相似记忆。
+     */
+    private boolean isDuplicate(Long userId, String content) {
+        try {
+            SearchRequest request = SearchRequest.builder()
+                    .query(content)
+                    .topK(1)
+                    .similarityThreshold(DEDUP_THRESHOLD)
+                    .filterExpression(new FilterExpressionBuilder()
+                            .eq("userId", userId)
+                            .build())
+                    .build();
+            List<Document> docs = vectorStore.similaritySearch(request);
+            return !docs.isEmpty();
+        } catch (Exception e) {
+            // 去重检查失败不阻塞写入
+            log.debug("KnowledgeMemory 去重检查失败，放行写入: {}", e.getMessage());
+            return false;
+        }
     }
 
     @Override

@@ -85,6 +85,23 @@ public class RetrievalContext {
     /** 检索模式（VECTOR_ONLY / BM25_ONLY / HYBRID_RRF），LLM 可在工具调用时覆盖 */
     private RetrievalMode retrievalMode = RetrievalMode.HYBRID_RRF;
 
+    // ==================== RAG 管线计时（由 SearchKnowledgeBaseTool 写入） ====================
+
+    /** 缓存查询耗时（毫秒） */
+    private long cacheQueryMs;
+    /** 指代消解耗时（毫秒） */
+    private long compressionMs;
+    /** 查询改写耗时（毫秒） */
+    private long rewriteMs;
+    /** 混合检索耗时（毫秒，含 Qdrant/ES/RRF/重排/DB/父文档） */
+    private long retrievalMs;
+    /** CRAG 纠正耗时（毫秒） */
+    private long cragMs;
+    /** 格式化输出耗时（毫秒） */
+    private long formatMs;
+    /** RAG 管线总耗时（毫秒） */
+    private long ragTotalMs;
+
     // ==================== Getters & Setters ====================
 
     public Double getUserX() { return userX; }
@@ -137,6 +154,29 @@ public class RetrievalContext {
 
     public RetrievalMode getRetrievalMode() { return retrievalMode; }
     public void setRetrievalMode(RetrievalMode retrievalMode) { this.retrievalMode = retrievalMode; }
+
+    // ==================== RAG 管线计时 Getters & Setters ====================
+
+    public long getCacheQueryMs() { return cacheQueryMs; }
+    public void setCacheQueryMs(long cacheQueryMs) { this.cacheQueryMs = cacheQueryMs; }
+
+    public long getCompressionMs() { return compressionMs; }
+    public void setCompressionMs(long compressionMs) { this.compressionMs = compressionMs; }
+
+    public long getRewriteMs() { return rewriteMs; }
+    public void setRewriteMs(long rewriteMs) { this.rewriteMs = rewriteMs; }
+
+    public long getRetrievalMs() { return retrievalMs; }
+    public void setRetrievalMs(long retrievalMs) { this.retrievalMs = retrievalMs; }
+
+    public long getCragMs() { return cragMs; }
+    public void setCragMs(long cragMs) { this.cragMs = cragMs; }
+
+    public long getFormatMs() { return formatMs; }
+    public void setFormatMs(long formatMs) { this.formatMs = formatMs; }
+
+    public long getRagTotalMs() { return ragTotalMs; }
+    public void setRagTotalMs(long ragTotalMs) { this.ragTotalMs = ragTotalMs; }
 
     /**
      * 根据查询分类 + 复杂度推导默认检索模式。

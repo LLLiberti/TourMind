@@ -10,10 +10,12 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * LLM 从一轮对话中提取的结构化记忆。
+ * LLM 从多轮对话中批量提取的结构化记忆（v3 批量模式）。
  *
- * <p>由 {@code MemoryExtractor} 生成，供 {@code MemoryCoordinator} 分发到
- * MySQL（结构化偏好）和 Qdrant（非结构化知识/事件）。</p>
+ * <p>由 {@code MemoryExtractor.extractBatch()} 生成，供 {@code MemoryCoordinator}
+ * 分发到 MySQL（结构化偏好 + 会话摘要）和 Qdrant（非结构化知识）。</p>
+ *
+ * <p>提取粒度：每 10 轮或 Session 结束批量提取一次，而非每轮单独提取。</p>
  */
 @Data
 @Builder
@@ -24,19 +26,20 @@ public class ExtractedMemory {
     /**
      * 用户画像更新 — key=字段名, value=新值。
      * null 值的 key 表示无变化，不会被写入 MySQL。
-     */@Builder.Default
+     */
+    @Builder.Default
     private Map<String, Object> profileUpdates = Collections.emptyMap();
 
     /**
-     * 新学到的事实/偏好知识。
+     * 新学到的事实/偏好知识（从整段对话中提取，非单轮粒度）。
      */
     @Builder.Default
     private List<MemoryFact> newFacts = Collections.emptyList();
 
     /**
-     * 本次交互摘要事件。
+     * 会话摘要（批量提取模式下的多轮对话摘要，替代 v1 的单轮 interactionEvent）。
      */
-    private InteractionEvent interactionEvent;
+    private ConversationSummaryResult conversationSummary;
 
     /** 是否有画像更新 */
     public boolean hasProfileUpdates() {
@@ -46,6 +49,13 @@ public class ExtractedMemory {
     /** 是否有新事实 */
     public boolean hasNewFacts() {
         return newFacts != null && !newFacts.isEmpty();
+    }
+
+    /** 是否有会话摘要 */
+    public boolean hasConversationSummary() {
+        return conversationSummary != null
+                && conversationSummary.getSummary() != null
+                && !conversationSummary.getSummary().isBlank();
     }
 
     // ==================== 内嵌类型 ====================
@@ -67,13 +77,20 @@ public class ExtractedMemory {
     @Builder
     @NoArgsConstructor
     @AllArgsConstructor
-    public static class InteractionEvent {
-        /** 交互摘要文本 */
+    public static class ConversationSummaryResult {
+        /** 对话主题（一句话概括） */
+        private String topic;
+        /** 累积摘要文本 */
         private String summary;
+        /** 用户目标/意图 */
+        private String userGoal;
         /** 涉及的实体（景点名/地名） */
         @Builder.Default
-        private List<String> entities = Collections.emptyList();
-        /** 交互结果: recommended / answered / deferred */
-        private String outcome;
+        private List<String> discussedEntities = Collections.emptyList();
+        /** 当前焦点（用户最近在关注什么） */
+        private String currentFocus;
+        /** 尚未解决的问题 */
+        @Builder.Default
+        private List<String> unresolvedQuestions = Collections.emptyList();
     }
 }
